@@ -2,12 +2,58 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { createInterface } from "readline";
+import { readFileSync, writeFileSync, existsSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
+
+// --- Interactive setup ---
+
+if (process.argv.includes("--setup")) {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const ask = (q) => new Promise((resolve) => rl.question(q, resolve));
+
+    console.log("\n  Monitor MCP Setup\n");
+
+    const apiUrl = (await ask("  Monitor API URL (https://monitor.appleby.cloud): ")).trim() || "https://monitor.appleby.cloud";
+    const apiKey = (await ask("  Monitor API Key: ")).trim();
+    rl.close();
+
+    if (!apiKey) {
+        console.error("\n  Error: API key is required.\n");
+        process.exit(1);
+    }
+
+    const mcpPath = join(homedir(), ".mcp.json");
+    let config = { mcpServers: {} };
+    if (existsSync(mcpPath)) {
+        try { config = JSON.parse(readFileSync(mcpPath, "utf-8")); } catch {}
+        if (!config.mcpServers) config.mcpServers = {};
+    }
+
+    config.mcpServers.monitor = {
+        command: "npx",
+        args: ["-y", "monitor-mcp"],
+        env: {
+            MONITOR_API_URL: apiUrl,
+            MONITOR_API_KEY: apiKey,
+        },
+    };
+
+    writeFileSync(mcpPath, JSON.stringify(config, null, 2) + "\n");
+    console.log(`\n  Written to ${mcpPath}`);
+    console.log("  Restart Claude Code to load the Monitor MCP server.\n");
+    process.exit(0);
+}
+
+// --- MCP Server ---
 
 const API_URL = process.env.MONITOR_API_URL;
 const API_KEY = process.env.MONITOR_API_KEY;
 
 if (!API_URL || !API_KEY) {
-    console.error("MONITOR_API_URL and MONITOR_API_KEY are required");
+    console.error("MONITOR_API_URL and MONITOR_API_KEY are required.");
+    console.error("Run `npx monitor-mcp --setup` to configure.");
     process.exit(1);
 }
 
