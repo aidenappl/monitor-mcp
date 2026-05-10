@@ -1,0 +1,30 @@
+{
+  "name": "monitor-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Monitor observability platform — query events, analytics, and diagnostics",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "monitor-mcp": "index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "mcp",
+    "monitor",
+    "observability",
+    "events",
+    "analytics",
+    "model-context-protocol"
+  ],
+  "author": "Aiden Appleby",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aidenappl/monitor-mcp.git"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  }
+}
