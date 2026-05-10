@@ -15,7 +15,7 @@ if (process.argv.includes("--setup")) {
 
     console.log("\n  Monitor MCP Setup\n");
 
-    const apiUrl = (await ask("  Monitor API URL (https://monitor.appleby.cloud): ")).trim() || "https://monitor.appleby.cloud";
+    const apiUrl = (await ask("  Monitor API URL (https://api.monitor.appleby.cloud): ")).trim() || "https://api.monitor.appleby.cloud";
     const apiKey = (await ask("  Monitor API Key: ")).trim();
     rl.close();
 

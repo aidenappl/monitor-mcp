@@ -23,7 +23,7 @@ Add to `~/.mcp.json`:
       "command": "npx",
       "args": ["-y", "monitor-mcp"],
       "env": {
-        "MONITOR_API_URL": "https://monitor.appleby.cloud",
+        "MONITOR_API_URL": "https://api.monitor.appleby.cloud",
         "MONITOR_API_KEY": "your-api-key"
       }
     }
