@@ -672,6 +672,147 @@ server.tool(
     }
 );
 
+// ==================== ISSUES ====================
+
+server.tool(
+    "monitor_list_issues",
+    "List error issues grouped by fingerprint. Issues aggregate repeated errors into a single trackable item with occurrence counts. Filter by status to see unresolved, resolved, or ignored issues.",
+    {
+        status: z.enum(["unresolved", "resolved", "ignored"]).optional().describe("Filter by issue status (default: all)"),
+        service: z.string().optional().describe("Filter by service name"),
+        limit: z.number().optional().describe("Max issues to return (default 50)"),
+        offset: z.number().optional().describe("Pagination offset (default 0)"),
+    },
+    async ({ status, service, limit, offset }) => {
+        const params = {};
+        if (status) params.status = status;
+        if (service) params.service = service;
+        if (limit) params.limit = limit;
+        if (offset) params.offset = offset;
+        const res = await api("GET", "/v1/issues", params);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_get_issue",
+    "Get full details of a specific issue by ID, including fingerprint, service, message, status, occurrence count, and timestamps.",
+    {
+        id: z.string().describe("The issue ID"),
+    },
+    async ({ id }) => {
+        const res = await api("GET", `/v1/issues/${id}`);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_update_issue",
+    "Update an issue's status — resolve, unresolve, or ignore it.",
+    {
+        id: z.string().describe("The issue ID"),
+        status: z.enum(["resolved", "unresolved", "ignored"]).describe("New status for the issue"),
+    },
+    async ({ id, status }) => {
+        const res = await api("PUT", `/v1/issues/${id}`, null, { status });
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_get_issue_events",
+    "Get events associated with a specific issue. Shows individual occurrences of the grouped error.",
+    {
+        id: z.string().describe("The issue ID"),
+        limit: z.number().optional().describe("Max events to return (1-100, default 20)"),
+    },
+    async ({ id, limit }) => {
+        const params = {};
+        if (limit) params.limit = limit;
+        const res = await api("GET", `/v1/issues/${id}/events`, params);
+        return { content: text(res) };
+    }
+);
+
+// ==================== API KEYS ====================
+
+server.tool(
+    "monitor_list_api_keys",
+    "List all API keys for the Monitor instance. Shows key metadata (name, scope, prefix) but not the full key value.",
+    {},
+    async () => {
+        const res = await api("GET", "/v1/api-keys");
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_create_api_key",
+    "Create a new API key. The full key is only shown once in the response — save it immediately.",
+    {
+        name: z.string().describe("Human-readable name for the key (e.g. 'frontend-ingest', 'ci-admin')"),
+        scope: z.enum(["admin", "ingest"]).describe("Key scope — 'ingest' for event ingestion only, 'admin' for full access"),
+    },
+    async ({ name, scope }) => {
+        const res = await api("POST", "/v1/api-keys", null, { name, scope });
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_delete_api_key",
+    "Delete an API key by ID. This immediately revokes access for anything using this key.",
+    {
+        id: z.string().describe("The API key ID to delete"),
+    },
+    async ({ id }) => {
+        const res = await api("DELETE", `/v1/api-keys/${id}`);
+        return { content: text(res) };
+    }
+);
+
+// ==================== ALERT RULES ====================
+
+server.tool(
+    "monitor_list_alert_rules",
+    "List all configured alert rules with their current state (enabled/disabled, firing status, thresholds).",
+    {},
+    async () => {
+        const res = await api("GET", "/v1/alert-rules");
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_test_alert_rule",
+    "Test an alert rule by evaluating it against current data. Returns the current value, threshold, condition, and whether it would fire.",
+    {
+        id: z.string().describe("The alert rule ID to test"),
+    },
+    async ({ id }) => {
+        const res = await api("POST", `/v1/alert-rules/${id}/test`);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_list_alert_history",
+    "List alert firing history. Shows when alerts triggered and resolved over time.",
+    {
+        rule_id: z.string().optional().describe("Filter to a specific alert rule"),
+        limit: z.number().optional().describe("Max entries to return (default 50)"),
+        offset: z.number().optional().describe("Pagination offset (default 0)"),
+    },
+    async ({ rule_id, limit, offset }) => {
+        const params = {};
+        if (rule_id) params.rule_id = rule_id;
+        if (limit) params.limit = limit;
+        if (offset) params.offset = offset;
+        const res = await api("GET", "/v1/alert-history", params);
+        return { content: text(res) };
+    }
+);
+
 // --- Start ---
 const transport = new StdioServerTransport();
 await server.connect(transport);
