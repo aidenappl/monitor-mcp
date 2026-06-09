@@ -796,6 +796,71 @@ server.tool(
 );
 
 server.tool(
+    "monitor_create_alert_rule",
+    "Create a new alert rule. Types: threshold (value crosses limit), absence (no events in window), rate_change (sudden spike/drop). Conditions: gt, lt, gte, lte, eq. Priority: P0 (critical), P1 (high), P2 (medium), P3 (low). query_filters is a JSON array of {field, operator, value} objects to scope the query (e.g. [{\"field\":\"service\",\"operator\":\"eq\",\"value\":\"auth-service-v2\"}]).",
+    {
+        name: z.string().describe("Human-readable alert name"),
+        description: z.string().optional().describe("Description of what this alert monitors"),
+        type: z.enum(["threshold", "absence", "rate_change"]).describe("Alert type"),
+        priority: z.enum(["P0", "P1", "P2", "P3"]).optional().describe("Priority level (default P2)"),
+        query_filters: z.string().describe("JSON array of filter objects: [{\"field\":\"service\",\"operator\":\"eq\",\"value\":\"scraper-service\"},{\"field\":\"name\",\"operator\":\"eq\",\"value\":\"scraper.ai.exhausted\"}]"),
+        metric: z.enum(["count", "avg", "max", "min", "sum", "p50", "p95", "p99"]).optional().describe("Metric to evaluate (default: count)"),
+        field: z.string().optional().describe("Data field for metric (e.g. data.duration_ms). Required for avg/max/min/sum/percentile metrics."),
+        condition: z.enum(["gt", "lt", "gte", "lte", "eq"]).describe("Comparison condition"),
+        threshold: z.number().describe("Threshold value"),
+        evaluation_interval_seconds: z.number().optional().describe("How often to check (default 60)"),
+        for_seconds: z.number().optional().describe("How long condition must hold before firing (default 0)"),
+        cooldown_seconds: z.number().optional().describe("Min time between notifications (default 300)"),
+        notification_channel_ids: z.string().optional().describe("JSON array of channel IDs to notify"),
+        enabled: z.boolean().optional().describe("Whether the rule is active (default true)"),
+    },
+    async (params) => {
+        const body = { ...params };
+        if (body.enabled === undefined) body.enabled = true;
+        const res = await api("POST", "/v1/alert-rules", null, body);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_update_alert_rule",
+    "Update an existing alert rule. Only provided fields are changed.",
+    {
+        id: z.string().describe("The alert rule ID to update"),
+        name: z.string().optional().describe("New name"),
+        description: z.string().optional().describe("New description"),
+        type: z.enum(["threshold", "absence", "rate_change"]).optional(),
+        priority: z.enum(["P0", "P1", "P2", "P3"]).optional(),
+        query_filters: z.string().optional(),
+        metric: z.string().optional(),
+        field: z.string().optional(),
+        condition: z.enum(["gt", "lt", "gte", "lte", "eq"]).optional(),
+        threshold: z.number().optional(),
+        evaluation_interval_seconds: z.number().optional(),
+        for_seconds: z.number().optional(),
+        cooldown_seconds: z.number().optional(),
+        notification_channel_ids: z.string().optional(),
+        enabled: z.boolean().optional(),
+    },
+    async ({ id, ...body }) => {
+        const res = await api("PUT", `/v1/alert-rules/${id}`, null, body);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_delete_alert_rule",
+    "Delete an alert rule by ID.",
+    {
+        id: z.string().describe("The alert rule ID to delete"),
+    },
+    async ({ id }) => {
+        const res = await api("DELETE", `/v1/alert-rules/${id}`);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
     "monitor_list_alert_history",
     "List alert firing history. Shows when alerts triggered and resolved over time.",
     {
