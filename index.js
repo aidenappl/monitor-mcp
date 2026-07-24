@@ -4,8 +4,12 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { createInterface } from "readline";
 import { readFileSync, writeFileSync, existsSync } from "fs";
-import { join } from "path";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
 import { homedir } from "os";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf-8"));
 
 // --- Interactive setup ---
 
@@ -50,6 +54,13 @@ if (process.argv.includes("--setup")) {
 
 const API_URL = process.env.MONITOR_API_URL;
 const API_KEY = process.env.MONITOR_API_KEY;
+// Optional admin *session* token (a Monitor access JWT). The `/admin/sso-providers*`
+// and `/auth/self*` routes sit behind monitor-core's SessionMiddleware, which accepts
+// ONLY an `Authorization: Bearer <access-jwt>` (or the mon-access-token cookie) — it
+// does NOT honour X-Api-Key. When this env var is set it is sent as a Bearer header so
+// those session-gated tools can work; the X-Api-Key header is always sent too and is
+// what every /v1/* (QueryAuthMiddleware) tool authenticates with.
+const SESSION_TOKEN = process.env.MONITOR_SESSION_TOKEN;
 
 if (!API_URL || !API_KEY) {
     console.error("MONITOR_API_URL and MONITOR_API_KEY are required.");
@@ -60,7 +71,11 @@ if (!API_URL || !API_KEY) {
 // --- API helper ---
 
 async function api(method, path, params, body) {
-    const url = new URL(path, API_URL);
+    // Preserve any base path on API_URL (e.g. https://host/basepath) by
+    // concatenating the trimmed base with the leading-slash path, rather than
+    // using new URL(path, base) which discards the base's path for absolute paths.
+    const base = API_URL.replace(/\/+$/, "");
+    const url = new URL(base + (path.startsWith("/") ? path : "/" + path));
     if (params) {
         for (const [k, v] of Object.entries(params)) {
             if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
@@ -75,6 +90,13 @@ async function api(method, path, params, body) {
         signal: AbortSignal.timeout(30000),
     };
 
+    // Session-gated routes (/admin/sso-providers*, /auth/self*) require a Bearer
+    // access JWT; X-Api-Key alone yields 401 there. Harmless on /v1/* routes, which
+    // check X-Api-Key first via QueryAuthMiddleware.
+    if (SESSION_TOKEN) {
+        opts.headers["Authorization"] = `Bearer ${SESSION_TOKEN}`;
+    }
+
     if (body) {
         opts.headers["Content-Type"] = "application/json";
         opts.body = JSON.stringify(body);
@@ -82,7 +104,29 @@ async function api(method, path, params, body) {
 
     try {
         const res = await fetch(url.toString(), opts);
-        return await res.json();
+        const raw = await res.text();
+        let parsed;
+        try {
+            parsed = raw ? JSON.parse(raw) : null;
+        } catch {
+            parsed = null;
+        }
+
+        if (!res.ok) {
+            // Surface the HTTP status even when the body isn't JSON (e.g. a
+            // proxy 401/403/500). Prefer the parsed error shape when present.
+            if (parsed && typeof parsed === "object") {
+                return { ...parsed, success: false, http_status: res.status };
+            }
+            return {
+                success: false,
+                http_status: res.status,
+                error: `HTTP ${res.status} ${res.statusText}`,
+                error_message: raw || res.statusText,
+            };
+        }
+
+        return parsed;
     } catch (err) {
         return { success: false, error: err.message };
     }
@@ -96,7 +140,7 @@ function text(data) {
 
 const server = new McpServer({
     name: "monitor",
-    version: "1.0.0",
+    version: pkg.version,
 });
 
 // ==================== HEALTH ====================
@@ -724,7 +768,7 @@ server.tool(
     "Get events associated with a specific issue. Shows individual occurrences of the grouped error.",
     {
         id: z.string().describe("The issue ID"),
-        limit: z.number().optional().describe("Max events to return (1-100, default 20)"),
+        limit: z.number().optional().describe("Max events to return (default 50, max 500)"),
     },
     async ({ id, limit }) => {
         const params = {};
@@ -824,7 +868,7 @@ server.tool(
 
 server.tool(
     "monitor_update_alert_rule",
-    "Update an existing alert rule. Only provided fields are changed.",
+    "Update an existing alert rule. This is a partial update: only fields you provide are sent, and any field you omit is left unchanged (including `enabled` — omit it to keep the rule's current on/off state; set it explicitly only when you intend to enable or disable the rule).",
     {
         id: z.string().describe("The alert rule ID to update"),
         name: z.string().optional().describe("New name"),
@@ -843,7 +887,14 @@ server.tool(
         enabled: z.boolean().optional(),
     },
     async ({ id, ...body }) => {
-        const res = await api("PUT", `/v1/alert-rules/${id}`, null, body);
+        // Only send fields the caller actually provided. In particular, never
+        // send enabled:false just because it was omitted — that would disable
+        // the rule (belt-and-suspenders alongside the backend preserving it).
+        const partial = {};
+        for (const [k, v] of Object.entries(body)) {
+            if (v !== undefined) partial[k] = v;
+        }
+        const res = await api("PUT", `/v1/alert-rules/${id}`, null, partial);
         return { content: text(res) };
     }
 );
@@ -874,6 +925,162 @@ server.tool(
         if (limit) params.limit = limit;
         if (offset) params.offset = offset;
         const res = await api("GET", "/v1/alert-history", params);
+        return { content: text(res) };
+    }
+);
+
+// ==================== NOTIFICATION CHANNELS ====================
+
+server.tool(
+    "monitor_list_notification_channels",
+    "List all notification channels. Use this to discover channel IDs to wire into an alert rule's notification_channel_ids. Each channel has an id, name, type (webhook/slack/email/pagerduty), and config.",
+    {},
+    async () => {
+        const res = await api("GET", "/v1/notification-channels");
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_create_notification_channel",
+    "Create a notification channel that alert rules can notify. Returns the created channel including its generated id. The `config` field is a JSON *string* whose shape depends on `type` (e.g. webhook: {\"url\":\"https://...\"}, slack: {\"webhook_url\":\"https://hooks.slack.com/...\"}, email: {\"to\":\"a@b.com\"}, pagerduty: {\"routing_key\":\"...\"}).",
+    {
+        name: z.string().describe("Human-readable channel name"),
+        type: z.enum(["webhook", "slack", "email", "pagerduty"]).describe("Channel type"),
+        config: z.string().optional().describe("Channel configuration as a JSON string (type-dependent). Defaults to empty."),
+    },
+    async ({ name, type, config }) => {
+        const body = { name, type };
+        if (config !== undefined) body.config = config;
+        const res = await api("POST", "/v1/notification-channels", null, body);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_delete_notification_channel",
+    "Delete a notification channel by ID. Alert rules referencing it will no longer notify through this channel.",
+    {
+        id: z.string().describe("The notification channel ID to delete"),
+    },
+    async ({ id }) => {
+        const res = await api("DELETE", `/v1/notification-channels/${id}`);
+        return { content: text(res) };
+    }
+);
+
+// ==================== SSO / AUTH ====================
+
+server.tool(
+    "monitor_get_sso_config",
+    "List the PUBLIC SSO login options (GET /auth/sso/config). This is the unauthenticated provider-discovery endpoint the login page uses: it returns only the ENABLED providers as {slug, button_label, login_url} — never any secret, client_id, or endpoint URL. No admin session required.",
+    {},
+    async () => {
+        const res = await api("GET", "/auth/sso/config");
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_list_sso_providers",
+    "List all SSO providers with their full admin configuration (GET /admin/sso-providers). Each provider includes has_secret (a boolean — the client_secret is NEVER returned) plus all URL/claim/flag fields. ADMIN SESSION REQUIRED: this route is behind monitor-core's SessionMiddleware + RequireAdmin, which accepts only a Bearer access JWT (or mon-access-token cookie), NOT the X-Api-Key. Set MONITOR_SESSION_TOKEN to an admin access JWT or this returns 401/403.",
+    {},
+    async () => {
+        const res = await api("GET", "/admin/sso-providers");
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_create_sso_provider",
+    "Create an SSO provider (POST /admin/sso-providers). slug and display_name are required; everything else is optional. kind is oidc (default) or oauth2 — OIDC providers set issuer_url (endpoints are discovered), OAuth2 providers set authorize_url/token_url/userinfo_url (and optionally introspect_url) explicitly. client_secret is PLAINTEXT and write-only: it is AES-256-GCM encrypted at rest and never echoed back (the response exposes only has_secret). Provide EITHER client_secret (encrypted at rest) OR client_secret_ref (a Keyring secret name), not both. scopes is a single space-separated string. ADMIN SESSION REQUIRED (SessionMiddleware + RequireAdmin, Bearer JWT only — X-Api-Key is rejected; set MONITOR_SESSION_TOKEN).",
+    {
+        slug: z.string().describe("URL-safe unique identifier (required), e.g. \"google\" or \"okta\""),
+        display_name: z.string().describe("Human-readable provider name (required)"),
+        kind: z.enum(["oidc", "oauth2"]).optional().describe("Provider protocol: oidc (default) or oauth2"),
+        issuer_url: z.string().optional().describe("OIDC issuer URL (endpoints auto-discovered). SSRF-validated."),
+        authorize_url: z.string().optional().describe("OAuth2 authorization endpoint. SSRF-validated."),
+        token_url: z.string().optional().describe("OAuth2 token endpoint. SSRF-validated."),
+        userinfo_url: z.string().optional().describe("OAuth2/OIDC userinfo endpoint. SSRF-validated."),
+        jwks_url: z.string().optional().describe("JWKS endpoint for verifying ID tokens. SSRF-validated."),
+        introspect_url: z.string().optional().describe("OAuth2 token introspection endpoint (used by the SSO revocation checkpoint). SSRF-validated."),
+        client_id: z.string().optional().describe("OAuth2/OIDC client id"),
+        client_secret: z.string().optional().describe("PLAINTEXT client secret — write-only, AES-256-GCM encrypted at rest, never returned. Mutually exclusive with client_secret_ref."),
+        client_secret_ref: z.string().optional().describe("Keyring secret name to resolve the client secret from. Mutually exclusive with client_secret."),
+        scopes: z.string().optional().describe("Space-separated OAuth scopes, e.g. \"openid email profile\""),
+        email_claim: z.string().optional().describe("Claim/field holding the user's email (e.g. \"email\")"),
+        email_verified_claim: z.string().optional().describe("Claim/field holding the email-verified boolean (e.g. \"email_verified\")"),
+        subject_claim: z.string().optional().describe("Claim/field holding the stable subject id (e.g. \"sub\")"),
+        trust_email_verified: z.boolean().optional().describe("Whether to trust the IdP's email_verified claim for auto-linking"),
+        allow_auto_link: z.boolean().optional().describe("Auto-link an SSO identity to an existing user with a matching verified email"),
+        auto_provision: z.boolean().optional().describe("Auto-create a (pending) user on first SSO login when no matching account exists"),
+        button_label: z.string().optional().describe("Override text for the login button (defaults to display_name)"),
+        enabled: z.boolean().optional().describe("Whether the provider is active and shown on the login page"),
+    },
+    async (body) => {
+        const payload = {};
+        for (const [k, v] of Object.entries(body)) {
+            if (v !== undefined) payload[k] = v;
+        }
+        const res = await api("POST", "/admin/sso-providers", null, payload);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_update_sso_provider",
+    "Update an SSO provider by slug (PUT /admin/sso-providers/{slug}). PARTIAL update: only the fields you provide are sent and changed; omitted fields are left unchanged. The slug itself is the path key and cannot be changed here. client_secret is plaintext/write-only (re-encrypted at rest, never returned); provide client_secret OR client_secret_ref. ADMIN SESSION REQUIRED (SessionMiddleware + RequireAdmin, Bearer JWT only — X-Api-Key is rejected; set MONITOR_SESSION_TOKEN).",
+    {
+        slug: z.string().describe("Slug of the provider to update (path parameter, immutable)"),
+        display_name: z.string().optional().describe("New display name"),
+        kind: z.enum(["oidc", "oauth2"]).optional().describe("Provider protocol: oidc or oauth2"),
+        issuer_url: z.string().optional().describe("OIDC issuer URL. SSRF-validated."),
+        authorize_url: z.string().optional().describe("OAuth2 authorization endpoint. SSRF-validated."),
+        token_url: z.string().optional().describe("OAuth2 token endpoint. SSRF-validated."),
+        userinfo_url: z.string().optional().describe("OAuth2/OIDC userinfo endpoint. SSRF-validated."),
+        jwks_url: z.string().optional().describe("JWKS endpoint. SSRF-validated."),
+        introspect_url: z.string().optional().describe("OAuth2 introspection endpoint. SSRF-validated."),
+        client_id: z.string().optional().describe("OAuth2/OIDC client id"),
+        client_secret: z.string().optional().describe("PLAINTEXT client secret — write-only, encrypted at rest, never returned. Mutually exclusive with client_secret_ref."),
+        client_secret_ref: z.string().optional().describe("Keyring secret name. Mutually exclusive with client_secret."),
+        scopes: z.string().optional().describe("Space-separated OAuth scopes"),
+        email_claim: z.string().optional().describe("Email claim/field name"),
+        email_verified_claim: z.string().optional().describe("Email-verified claim/field name"),
+        subject_claim: z.string().optional().describe("Subject-id claim/field name"),
+        trust_email_verified: z.boolean().optional().describe("Trust the IdP's email_verified claim"),
+        allow_auto_link: z.boolean().optional().describe("Auto-link to an existing user by verified email"),
+        auto_provision: z.boolean().optional().describe("Auto-create a pending user on first login"),
+        button_label: z.string().optional().describe("Login button label"),
+        enabled: z.boolean().optional().describe("Whether the provider is active"),
+    },
+    async ({ slug, ...body }) => {
+        const payload = {};
+        for (const [k, v] of Object.entries(body)) {
+            if (v !== undefined) payload[k] = v;
+        }
+        const res = await api("PUT", `/admin/sso-providers/${slug}`, null, payload);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_delete_sso_provider",
+    "Delete an SSO provider by slug (DELETE /admin/sso-providers/{slug}). ADMIN SESSION REQUIRED (SessionMiddleware + RequireAdmin, Bearer JWT only — X-Api-Key is rejected; set MONITOR_SESSION_TOKEN).",
+    {
+        slug: z.string().describe("Slug of the provider to delete"),
+    },
+    async ({ slug }) => {
+        const res = await api("DELETE", `/admin/sso-providers/${slug}`);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_get_self",
+    "Get the currently authenticated Monitor user and their linked sign-in identities (GET /auth/self). Returns the neutral user record (no password hash) plus an identities array of linked providers. SESSION REQUIRED: this route is behind SessionMiddleware and identifies the user FROM the session token, so it reflects whoever MONITOR_SESSION_TOKEN belongs to — X-Api-Key is not accepted and there is no way to look up an arbitrary user here. Returns 401 if MONITOR_SESSION_TOKEN is unset.",
+    {},
+    async () => {
+        const res = await api("GET", "/auth/self");
         return { content: text(res) };
     }
 );
