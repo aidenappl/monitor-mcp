@@ -98,12 +98,33 @@ Event search supports Django-style filter operators:
 
 Data fields use the `data.` prefix: `data.endpoint__contains=/api`, `data.status_code__gte=500`.
 
+## Secret values are masked
+
+Every response is passed through a masking step before it reaches the model. Anything that looks
+like a credential keeps its **first two characters** and loses the rest to a fixed-width tail —
+`supersecret` becomes `su**********`.
+
+That is enough to tell two credentials apart, or to confirm a rotation actually changed
+something, and not enough to use. The tail is a fixed width so the mask does not reveal the real
+length.
+
+The main thing this covers is `monitor_create_api_key`, which returns a full admin or ingest key
+once — enough to read every event the platform holds. `key_prefix` is left readable, since it is
+a non-secret identifier for matching a key to its record.
+
+Event payloads (`data`, `context`, `extra`, `tags`) are **not** masked. They are free-form and
+come from your instrumented services; if a service logs a secret into an event, it will still
+show up here, and the fix belongs in that service.
+
+Set `MONITOR_ALLOW_SECRET_VALUES=1` to turn masking off if you genuinely need a working value.
+
 ## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `MONITOR_API_URL` | Yes | Monitor API base URL |
 | `MONITOR_API_KEY` | Yes | API key for authentication (via `X-Api-Key` header) |
+| `MONITOR_ALLOW_SECRET_VALUES` | No | Set to `1` to disable secret masking in responses |
 
 ## License
 

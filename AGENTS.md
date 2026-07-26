@@ -160,6 +160,33 @@ Per the house rule, these `monitor-core` routes have **no MCP tool** — decide 
 
 ---
 
+## 8a. Sensitive value masking
+
+`api()` passes every decoded JSON response through **`sanitise()`** before returning it. This is
+central, not per-tool, so a newly added tool is safe by default rather than by remembering.
+
+`mask()` keeps a value's **first two characters** and appends a **fixed-width tail** —
+`"supersecret"` → `"su**********"`. The prefix is what makes the mask useful rather than merely
+safe: you can still tell one credential from another, or confirm a rotation changed a value.
+The tail is fixed width so the mask does not disclose the real length. Values under three
+characters are masked whole. The same shape is implemented in all five `*-mcp` servers.
+
+`monitor-core` already keeps SSO client secrets write-only — `/admin/sso-providers` returns only
+`has_secret` — so the gap this closes is **`monitor_create_api_key`**, which returns a full
+admin or ingest key once, and that key can read every event the platform holds. `key_prefix` is
+deliberately *not* masked: it is a non-secret identifier for matching a key to its record, and
+masking it would defeat the point of listing keys.
+
+**Event payloads are not walked.** `data`, `context`, `extra` and `tags` pass through intact.
+They are free-form and come from instrumented services; a key-name heuristic over them produces
+noise without producing safety. If a service logs a secret into an event, it will still surface
+here — **that is a bug in the emitting service and the fix belongs there**, not in a guess about
+payload shape.
+
+`MONITOR_ALLOW_SECRET_VALUES=1` disables masking. It is off by default and should stay that way.
+
+---
+
 ## 9. Rules & guardrails + known issues
 
 **Rules**
@@ -167,6 +194,9 @@ Per the house rule, these `monitor-core` routes have **no MCP tool** — decide 
 - Keep `query_filters`/`notification_channel_ids` as JSON strings.
 - `server.version` is read from `package.json` at startup — bump only `package.json`.
 - Any new `monitor-core` route → add or consciously skip a tool here.
+- **Never weaken `sanitise()`** (§8a) — it must stay recursive, applied centrally in `api()`, and
+  on by default. If something genuinely needs a real value, the answer is
+  `MONITOR_ALLOW_SECRET_VALUES=1` in that server's env, not an exemption in the code.
 
 **Known issues & gaps** — all resolved in the 2026-07-23 fix pass (kept here for traceability):
 

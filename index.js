@@ -116,7 +116,7 @@ async function api(method, path, params, body) {
             // Surface the HTTP status even when the body isn't JSON (e.g. a
             // proxy 401/403/500). Prefer the parsed error shape when present.
             if (parsed && typeof parsed === "object") {
-                return { ...parsed, success: false, http_status: res.status };
+                return { ...sanitise(parsed), success: false, http_status: res.status };
             }
             return {
                 success: false,
@@ -126,7 +126,7 @@ async function api(method, path, params, body) {
             };
         }
 
-        return parsed;
+        return sanitise(parsed);
     } catch (err) {
         return { success: false, error: err.message };
     }
@@ -134,6 +134,65 @@ async function api(method, path, params, body) {
 
 function text(data) {
     return [{ type: "text", text: JSON.stringify(data, null, 2) }];
+}
+
+// --- Sensitive value masking ---
+//
+// monitor-core keeps SSO client secrets write-only (reads expose only
+// has_secret), but monitor_create_api_key returns a full admin or ingest key
+// once, and that key is enough to read every event the platform holds.
+// Anything that reaches a model's context is in a transcript forever.
+//
+// Sensitive values are masked to their first two characters plus a
+// fixed-width tail: "mon_abc123" -> "mo**********". The prefix keeps a value
+// identifiable and comparable while the fixed tail avoids disclosing length.
+// Read the usable value from the Monitor UI instead.
+//
+// Note this does NOT reach into event `data` payloads. Those are free-form and
+// come from instrumented services; if a service logs a secret into an event,
+// it will still surface here. That is a bug in the emitting service, and the
+// fix belongs there rather than in a guess about payload shape.
+//
+// Set MONITOR_ALLOW_SECRET_VALUES=1 to pass values through unmasked.
+
+const ALLOW_SECRETS = process.env.MONITOR_ALLOW_SECRET_VALUES === "1";
+
+function mask(value) {
+    if (typeof value !== "string" || value === "") return value;
+    // Under three characters there is no prefix worth keeping — a two-char
+    // secret would otherwise round-trip as itself.
+    if (value.length < 3) return "**********";
+    return value.slice(0, 2) + "**********";
+}
+
+// Response fields that are a credential wherever they appear. `key_prefix` is
+// deliberately absent: it is a non-secret identifier for matching a key to its
+// record, and masking it would defeat the point of listing keys at all.
+const SECRET_FIELDS = new Set([
+    "key", "api_key", "token", "api_token", "access_token", "refresh_token",
+    "client_secret", "secret", "password", "plaintext", "signing_key",
+]);
+
+// Event payloads are user-supplied and arbitrarily shaped; walking into them
+// with a key-name heuristic produces noise without producing safety. They are
+// left intact, as documented above.
+const OPAQUE_FIELDS = new Set(["data", "context", "extra", "tags"]);
+
+// Walks a decoded response and masks every sensitive value in place.
+function sanitise(node) {
+    if (ALLOW_SECRETS || node === null || typeof node !== "object") return node;
+    if (Array.isArray(node)) return node.map(sanitise);
+    const out = {};
+    for (const [k, v] of Object.entries(node)) {
+        if (OPAQUE_FIELDS.has(k)) {
+            out[k] = v;
+        } else if (SECRET_FIELDS.has(k) && typeof v === "string") {
+            out[k] = mask(v);
+        } else {
+            out[k] = sanitise(v);
+        }
+    }
+    return out;
 }
 
 // --- Server ---
@@ -792,7 +851,7 @@ server.tool(
 
 server.tool(
     "monitor_create_api_key",
-    "Create a new API key. The full key is only shown once in the response — save it immediately.",
+    "Create a new API key. The full key is only shown once, and this server masks it to its first two characters — the key will exist but you will not be able to read it here. Create keys in the Monitor UI when you need the value, or set MONITOR_ALLOW_SECRET_VALUES=1.",
     {
         name: z.string().describe("Human-readable name for the key (e.g. 'frontend-ingest', 'ci-admin')"),
         scope: z.enum(["admin", "ingest"]).describe("Key scope — 'ingest' for event ingestion only, 'admin' for full access"),
