@@ -206,7 +206,7 @@ payload shape.
 | G1 | 🟡 | notification channels | ✅ **Fixed.** Added `monitor_list_notification_channels` (GET), `monitor_create_notification_channel` (POST — `name`, `type`, `config` JSON string), `monitor_delete_notification_channel` (DELETE). Shapes verified against `routes/alerts.go` + `alerts.Channel`/`CreateChannel`. |
 | C2 | 🟢 | `api()` | ✅ **Fixed.** `api()` now checks `res.ok`, reads the body as text, JSON-parses when possible, and on non-ok returns an object carrying `http_status` and the body (parsed or raw). |
 | C3 | 🟢 | `api()` URL build | ✅ **Fixed.** URL is now `API_URL` (trailing slash stripped) + leading-slash path, so a base like `https://host/basepath` is preserved. |
-| C4 | 🟢 | `server.version` | ✅ **Fixed.** `server.version` now reads from `package.json` at startup (currently `1.0.3`). Package version not bumped. |
+| C4 | 🟢 | `server.version` | ✅ **Fixed.** `server.version` reads from `package.json` at startup, so bumping only `package.json` is correct and the two cannot drift. |
 | C5 | 🟢 | `monitor_get_issue_events` | ✅ **Fixed.** `limit` description now reads "default 50, max 500" to match the handler. |
 
 ---
