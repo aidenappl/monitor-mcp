@@ -95,7 +95,7 @@ tool here in the same change. See §7 for the current gaps.
 
 ---
 
-## 6. Tool inventory (42 tools)
+## 6. Tool inventory (53 tools)
 
 Discovery/query: `monitor_health`, `monitor_list_services|environments|event_names|
 levels|users`, `monitor_get_data_keys|data_values`, `monitor_search_events`,
@@ -103,8 +103,32 @@ levels|users`, `monitor_get_data_keys|data_values`, `monitor_search_events`,
 `monitor_compare`, `monitor_trace`, `monitor_request`, `monitor_recent_errors`,
 `monitor_error_breakdown`, `monitor_error_trend`, `monitor_service_overview`.
 
-Issues: `monitor_list_issues`, `monitor_get_issue`, `monitor_update_issue`,
-`monitor_get_issue_events`.
+Issues — the error-tracking surface (expanded 2026-08-25, verified against
+`monitor-core/routes/issues.go`, `issue_timeline.go` and `service_repos.go`):
+`monitor_list_issues`, `monitor_get_issue`, `monitor_update_issue`,
+`monitor_get_issue_events`, `monitor_get_issue_timeline`, `monitor_get_issue_history`,
+`monitor_add_issue_comment`, `monitor_edit_issue_comment`, `monitor_delete_issue_comment`,
+`monitor_list_issue_links`, `monitor_link_issue_pr`, `monitor_unlink_issue_pr`.
+
+Service repositories: `monitor_list_service_repos`, `monitor_set_service_repo`,
+`monitor_delete_service_repo`.
+
+**Four things to get right in this block, all verified against the handlers:**
+
+- **`status` ∈ unresolved | in_progress | resolved | ignored.** `in_progress` was added
+  2026-08-25; a tool schema still listing three values rejects it client-side while the API
+  accepts it, which is how this server briefly drifted from monitor-core. `unresolved` is
+  also the backlog — there is no separate `backlog` value.
+- **`status` is OPTIONAL on `monitor_update_issue`.** It used to be required, back when it
+  was the only mutable field. Priority, title and assignee are now settable too.
+- **Clearing a field needs an explicit JSON `null`.** The API distinguishes
+  `{"priority": null}` (unset it) from an omitted key (leave it), which one optional
+  parameter cannot express — hence the `clear_priority` / `clear_title` / `clear_assignee`
+  flags, which map onto nulls in the request body.
+- **`dedupe_key` on `monitor_add_issue_comment` is what makes agent notes idempotent.**
+  Without one, every call appends another comment; with one, an identical body is a no-op
+  and a changed body edits in place. The tool description tells the model to pass it — that
+  wording is load-bearing, not decoration.
 
 API keys: `monitor_list_api_keys`, `monitor_create_api_key`, `monitor_delete_api_key`.
 
@@ -139,6 +163,7 @@ Per the house rule, these `monitor-core` routes have **no MCP tool** — decide 
 
 | Route(s) | Assessment |
 |---|---|
+| `GET /v1/service-repos/{service}` | **Consciously skipped.** `monitor_list_service_repos` returns every mapping in one call and the estate has ~15 services, so a single-service fetch would be a second round trip for a subset of what the model already has. |
 | `POST /v1/notification-channels/{id}/test` | Minor skip — list/create/delete are now covered (`monitor_list|create|delete_notification_channel`); the test-send route has no tool yet. Add or leave skipped. |
 | `/v1/service-groups`, `/v1/notification-policies` | Gap — routing config unreachable via MCP. Add or document as skipped. |
 | `GET /v1/alert-rules/{id}` | Minor — `list` covers it. |

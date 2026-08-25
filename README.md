@@ -73,6 +73,43 @@ Add to `~/.mcp.json`:
 | `monitor_error_trend` | Error count over time (is it getting worse?) |
 | `monitor_service_overview` | Composite health summary — total events, error count, error rate, top events, top errors |
 
+### Issue Tracking
+Errors grouped by fingerprint into trackable issues, with triage state, a comment
+thread, linked pull requests and durable occurrence history.
+
+| Tool | Description |
+|------|-------------|
+| `monitor_list_issues` | List issues, filtered by status, service, assignee, `has_pr`, search or time window |
+| `monitor_get_issue` | Full detail — links, assignee, repository, comment count, 30-day sparkline |
+| `monitor_update_issue` | Set status, priority, title or assignee. Every change is recorded on the timeline against you |
+| `monitor_get_issue_events` | Individual occurrences with their data payloads (raw events expire after 30 days) |
+| `monitor_get_issue_timeline` | The activity feed — comments, status changes, regressions, PR events |
+| `monitor_get_issue_history` | Per-day occurrence counts. Survives the 30-day event expiry |
+| `monitor_add_issue_comment` | Leave a note while working an issue. Pass `dedupe_key` to stay idempotent |
+| `monitor_edit_issue_comment` / `monitor_delete_issue_comment` | Amend or soft-delete a note |
+| `monitor_list_issue_links` / `monitor_link_issue_pr` / `monitor_unlink_issue_pr` | Manage linked PRs, issues and commits |
+
+**Status** is `unresolved` (also the backlog), `in_progress`, `resolved` or `ignored`.
+An error recurring on a `resolved` issue reopens it as a regression; one recurring on an
+`in_progress` issue leaves it alone, so picking work up is never undone by the error
+happening again.
+
+**Leaving notes idempotently.** `monitor_add_issue_comment` appends a comment on every
+call unless you pass a `dedupe_key`. With one, reposting the same body is a no-op and a
+changed body edits the note in place — which is what lets a retried task, or the same
+investigation resumed in a later session, avoid leaving five copies of one note.
+
+### Service Repositories
+| Tool | Description |
+|------|-------------|
+| `monitor_list_service_repos` | Which source repository each reporting service is built from |
+| `monitor_set_service_repo` | Map a service to `owner/repo` |
+| `monitor_delete_service_repo` | Remove a mapping |
+
+Several services routinely share one repository — `auth-service-v1` and `auth-service-v2`
+are versions of one service — so the mapping is explicit rather than derived from the
+service name. Mapping a service is what lets `monitor_link_issue_pr` accept a bare `#42`.
+
 ## Example Prompts
 
 - "What errors happened in the last hour?"
@@ -82,6 +119,9 @@ Add to `~/.mcp.json`:
 - "Give me an overview of the johnnies-api service"
 - "What are the top 10 most common errors?"
 - "Find all events where data.status_code >= 500"
+- "Show me unresolved issues for scraper-service with no linked PR"
+- "Mark issue X as in progress and note that I'm investigating the Workday timeout"
+- "When did this issue first start firing, and how often does it recur?"
 
 ## Filter Syntax
 

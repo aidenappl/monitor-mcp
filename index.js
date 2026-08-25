@@ -776,20 +776,41 @@ server.tool(
 );
 
 // ==================== ISSUES ====================
+//
+// Issues are Monitor's error-tracking surface: errors grouped by fingerprint,
+// carrying triage state, a timeline, linked pull requests and durable occurrence
+// history. Status, comments and links live in MariaDB; the raw events they
+// summarise live in ClickHouse under a 30-day TTL.
 
 server.tool(
     "monitor_list_issues",
-    "List error issues grouped by fingerprint. Issues aggregate repeated errors into a single trackable item with occurrence counts. Filter by status to see unresolved, resolved, or ignored issues.",
+    "List error issues grouped by fingerprint. Issues aggregate repeated errors into a single trackable item with occurrence counts, triage status, linked PRs and a comment thread. This is the primary entry point for reviewing errors — start here, then monitor_get_issue for detail.",
     {
-        status: z.enum(["unresolved", "resolved", "ignored"]).optional().describe("Filter by issue status (default: all)"),
+        status: z.enum(["unresolved", "in_progress", "resolved", "ignored"]).optional()
+            .describe("Filter by status. 'unresolved' is also the backlog — it is the default for a newly-created issue. Omit for all."),
         service: z.string().optional().describe("Filter by service name"),
-        limit: z.number().optional().describe("Max issues to return (default 50)"),
+        assignee: z.string().optional()
+            .describe("Filter by assignee user id, or the literal 'none' for unassigned issues"),
+        has_pr: z.boolean().optional().describe("Only issues that do (or do not) have a linked pull request"),
+        q: z.string().optional().describe("Substring search across name, message, title and path"),
+        from: z.string().optional().describe("Only issues last seen at or after this time (RFC3339 or unix seconds)"),
+        to: z.string().optional().describe("Only issues last seen at or before this time (RFC3339 or unix seconds)"),
+        sort: z.enum(["last_seen", "first_seen", "occurrences"]).optional().describe("Sort column (default last_seen)"),
+        order: z.enum(["asc", "desc"]).optional().describe("Sort direction (default desc)"),
+        limit: z.number().optional().describe("Max issues to return (default 50, max 500)"),
         offset: z.number().optional().describe("Pagination offset (default 0)"),
     },
-    async ({ status, service, limit, offset }) => {
+    async ({ status, service, assignee, has_pr, q, from, to, sort, order, limit, offset }) => {
         const params = {};
         if (status) params.status = status;
         if (service) params.service = service;
+        if (assignee) params.assignee = assignee;
+        if (has_pr !== undefined) params.has_pr = has_pr;
+        if (q) params.q = q;
+        if (from) params.from = from;
+        if (to) params.to = to;
+        if (sort) params.sort = sort;
+        if (order) params.order = order;
         if (limit) params.limit = limit;
         if (offset) params.offset = offset;
         const res = await api("GET", "/v1/issues", params);
@@ -799,7 +820,7 @@ server.tool(
 
 server.tool(
     "monitor_get_issue",
-    "Get full details of a specific issue by ID, including fingerprint, service, message, status, occurrence count, and timestamps.",
+    "Get full details of an issue: fingerprint, service, message, status, occurrence and regression counts, timestamps, linked pull requests, assignee, source repository, comment count, and a 30-day occurrence sparkline.",
     {
         id: z.string().describe("The issue ID"),
     },
@@ -811,20 +832,42 @@ server.tool(
 
 server.tool(
     "monitor_update_issue",
-    "Update an issue's status — resolve, unresolve, or ignore it.",
+    "Update an issue's triage state. Every field is optional — supply only what should change. Each changed field is recorded on the issue timeline against you, so a status change made here is attributed to this API key rather than landing anonymously.",
     {
         id: z.string().describe("The issue ID"),
-        status: z.enum(["resolved", "unresolved", "ignored"]).describe("New status for the issue"),
+        status: z.enum(["unresolved", "in_progress", "resolved", "ignored"]).optional()
+            .describe("New status. Set 'in_progress' when starting work — a recurrence of the error will NOT reset it, whereas a recurrence of a 'resolved' issue reopens it as a regression."),
+        priority: z.enum(["low", "medium", "high", "critical"]).optional().describe("New priority"),
+        title: z.string().optional().describe("Human-facing title, overriding the derived message"),
+        assignee_user_id: z.number().optional().describe("Monitor user id to assign to"),
+        clear_priority: z.boolean().optional().describe("Unset the priority"),
+        clear_title: z.boolean().optional().describe("Unset the title"),
+        clear_assignee: z.boolean().optional().describe("Unassign the issue"),
     },
-    async ({ id, status }) => {
-        const res = await api("PUT", `/v1/issues/${id}`, null, { status });
+    async ({ id, status, priority, title, assignee_user_id, clear_priority, clear_title, clear_assignee }) => {
+        // The API distinguishes an explicit JSON null (clear the field) from an
+        // omitted key (leave it alone), which a single optional parameter cannot
+        // express — hence the separate clear_* flags mapping onto nulls.
+        const body = {};
+        if (status !== undefined) body.status = status;
+        if (clear_priority) body.priority = null;
+        else if (priority !== undefined) body.priority = priority;
+        if (clear_title) body.title = null;
+        else if (title !== undefined) body.title = title;
+        if (clear_assignee) body.assignee_user_id = null;
+        else if (assignee_user_id !== undefined) body.assignee_user_id = assignee_user_id;
+
+        if (Object.keys(body).length === 0) {
+            return { content: text({ error: "supply at least one field to update" }) };
+        }
+        const res = await api("PUT", `/v1/issues/${id}`, null, body);
         return { content: text(res) };
     }
 );
 
 server.tool(
     "monitor_get_issue_events",
-    "Get events associated with a specific issue. Shows individual occurrences of the grouped error.",
+    "Get individual event occurrences behind a grouped issue, with their full data payloads. Note that raw events expire after 30 days — use monitor_get_issue_history for older activity, which survives that expiry.",
     {
         id: z.string().describe("The issue ID"),
         limit: z.number().optional().describe("Max events to return (default 50, max 500)"),
@@ -833,6 +876,174 @@ server.tool(
         const params = {};
         if (limit) params.limit = limit;
         const res = await api("GET", `/v1/issues/${id}/events`, params);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_get_issue_timeline",
+    "Get an issue's activity feed, oldest first: comments, status changes, regressions, assignments, and pull-request events interleaved chronologically. Read this before commenting so you do not repeat what is already recorded.",
+    {
+        id: z.string().describe("The issue ID"),
+        type: z.enum([
+            "comment", "status_changed", "regressed", "assigned", "unassigned",
+            "priority_changed", "title_changed", "pr_linked", "pr_unlinked",
+            "pr_merged", "pr_closed", "pr_reopened",
+        ]).optional().describe("Only entries of this kind"),
+        include_deleted: z.boolean().optional().describe("Include soft-deleted comments (default false)"),
+        limit: z.number().optional().describe("Max entries to return (default 50, max 500)"),
+        offset: z.number().optional().describe("Pagination offset"),
+    },
+    async ({ id, type, include_deleted, limit, offset }) => {
+        const params = {};
+        if (type) params.type = type;
+        if (include_deleted !== undefined) params.include_deleted = include_deleted;
+        if (limit) params.limit = limit;
+        if (offset) params.offset = offset;
+        const res = await api("GET", `/v1/issues/${id}/timeline`, params);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_add_issue_comment",
+    "Add a note to an issue's timeline. This is how you record what you found and what you did while working an issue — attributed to this API key, visible in the Monitor UI alongside human comments.\n\nPASS A dedupe_key whenever the note might be written more than once (a retried task, or the same investigation resumed in a later session). The write is then idempotent per key: an identical body is a no-op, a changed body edits the note in place. Without one, every call appends another comment. A stable key such as 'triage:<issue-id>' or 'run:<task-name>' is usually right.",
+    {
+        id: z.string().describe("The issue ID"),
+        body: z.string().describe("The note. Markdown renders in the Monitor UI."),
+        dedupe_key: z.string().optional()
+            .describe("Idempotency key, unique per issue. Reposting with the same key updates that note instead of adding another."),
+    },
+    async ({ id, body, dedupe_key }) => {
+        const payload = { body };
+        if (dedupe_key) payload.dedupe_key = dedupe_key;
+        const res = await api("POST", `/v1/issues/${id}/comments`, null, payload);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_edit_issue_comment",
+    "Replace the body of an existing comment. Only comments are editable — a status change or a pull-request event is a historical fact, not a draft.",
+    {
+        id: z.string().describe("The issue ID"),
+        comment_id: z.number().describe("The timeline entry ID of the comment"),
+        body: z.string().describe("The replacement text"),
+    },
+    async ({ id, comment_id, body }) => {
+        const res = await api("PATCH", `/v1/issues/${id}/comments/${comment_id}`, null, { body });
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_delete_issue_comment",
+    "Soft-delete a comment. The row is kept so the timeline's shape and the audit trail survive; the comment simply stops being returned.",
+    {
+        id: z.string().describe("The issue ID"),
+        comment_id: z.number().describe("The timeline entry ID of the comment"),
+    },
+    async ({ id, comment_id }) => {
+        const res = await api("DELETE", `/v1/issues/${id}/comments/${comment_id}`);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_get_issue_history",
+    "Get per-day occurrence counts for an issue. This reads a rollup with NO retention limit, so it still has shape for an issue whose raw events have expired — use it, not monitor_get_issue_events, to answer 'when did this start' or 'how often does it recur'.",
+    {
+        id: z.string().describe("The issue ID"),
+        from: z.string().optional().describe("Window start (RFC3339 or unix seconds, default 30 days ago)"),
+        to: z.string().optional().describe("Window end (RFC3339 or unix seconds, default now)"),
+    },
+    async ({ id, from, to }) => {
+        const params = {};
+        if (from) params.from = from;
+        if (to) params.to = to;
+        const res = await api("GET", `/v1/issues/${id}/history`, params);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_list_issue_links",
+    "List the GitHub pull requests, issues and commits linked to an issue, with their cached state (open/closed/merged).",
+    {
+        id: z.string().describe("The issue ID"),
+    },
+    async ({ id }) => {
+        const res = await api("GET", `/v1/issues/${id}/links`);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_link_issue_pr",
+    "Link a GitHub pull request, issue or commit to a Monitor issue. Accepts a full URL, 'owner/repo#42', or a bare '#42' — the last resolved against the service's mapped repository (see monitor_list_service_repos), so a shorthand only works for a mapped service.\n\nLinking does not change issue status, and neither does the PR later merging: resolving stays a deliberate action.",
+    {
+        id: z.string().describe("The issue ID"),
+        url: z.string().describe("A GitHub URL, owner/repo#number, or #number"),
+    },
+    async ({ id, url }) => {
+        const res = await api("POST", `/v1/issues/${id}/links`, null, { url });
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_unlink_issue_pr",
+    "Remove a link from an issue.",
+    {
+        id: z.string().describe("The issue ID"),
+        link_id: z.number().describe("The link ID, from monitor_list_issue_links"),
+    },
+    async ({ id, link_id }) => {
+        const res = await api("DELETE", `/v1/issues/${id}/links/${link_id}`);
+        return { content: text(res) };
+    }
+);
+
+// ==================== SERVICE REPOSITORIES ====================
+//
+// Monitor watches services across more than one GitHub org, and several service
+// versions routinely share one repo (auth-service-v1 and -v2), so the mapping is
+// explicit rather than derived from the service name.
+
+server.tool(
+    "monitor_list_service_repos",
+    "List which source repository each reporting service is built from. A service missing from this list is unmapped: links to it still work, but only as full URLs — shorthand like '#42' cannot be resolved.",
+    {},
+    async () => {
+        const res = await api("GET", "/v1/service-repos");
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_set_service_repo",
+    "Map a service to its source repository. Several services may share one repository — that is the normal case for versioned services such as auth-service-v1 and auth-service-v2.",
+    {
+        service: z.string().describe("The service name as it reports to Monitor"),
+        repository: z.string().describe("'owner/repo', or any github.com URL naming the repository"),
+        default_branch: z.string().optional().describe("Default branch, e.g. main"),
+    },
+    async ({ service, repository, default_branch }) => {
+        const body = { repository };
+        if (default_branch) body.default_branch = default_branch;
+        const res = await api("PUT", `/v1/service-repos/${encodeURIComponent(service)}`, null, body);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_delete_service_repo",
+    "Remove a service's repository mapping.",
+    {
+        service: z.string().describe("The service name"),
+    },
+    async ({ service }) => {
+        const res = await api("DELETE", `/v1/service-repos/${encodeURIComponent(service)}`);
         return { content: text(res) };
     }
 );
