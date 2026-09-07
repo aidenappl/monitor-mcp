@@ -43,6 +43,16 @@ Add to `~/.mcp.json`:
 | `monitor_list_levels` | List log levels in use |
 | `monitor_list_users` | List user IDs that have generated events |
 
+### Zones & Projects
+| Tool | Description |
+|------|-------------|
+| `monitor_list_zones` | The zones this install knows about — a zone is one whole Monitor deployment |
+| `monitor_list_projects` | The projects (tenants) inside one zone, plus the install's default |
+
+Both are read-only, and `monitor_list_projects` returns an object —
+`{"projects": [...], "default_project_slug": "..."}` — not a bare array. See
+[Which project you are reading](#which-project-you-are-reading).
+
 ### Event Search
 | Tool | Description |
 |------|-------------|
@@ -122,6 +132,7 @@ service name. Mapping a service is what lets `monitor_link_issue_pr` accept a ba
 - "Show me unresolved issues for scraper-service with no linked PR"
 - "Mark issue X as in progress and note that I'm investigating the Workday timeout"
 - "When did this issue first start firing, and how often does it recur?"
+- "Which project am I reading, and what other projects exist in this zone?"
 
 ## Filter Syntax
 
@@ -137,6 +148,63 @@ Event search supports Django-style filter operators:
 | `in` | `level__in=error,fatal` | Match any value |
 
 Data fields use the `data.` prefix: `data.endpoint__contains=/api`, `data.status_code__gte=500`.
+
+## Which project you are reading
+
+Monitor is multi-tenant. A **zone** is one whole Monitor deployment — its own storage, its
+own URL, its own API keys — and a **project** is a tenant inside a zone. Every event is
+filed under a project, stamped server-side from the API key that sent it.
+
+**Your API key decides which project you read, and nothing in a request can change it.**
+An admin key reads only the project its own key record names; "admin" is a scope over
+what you may do (query vs. ingest), not over whose data you may see. That is why no tool
+here takes a `project` argument — it would be an argument the server ignores.
+
+So every project-scoped answer carries a `_scope` annotation naming the project that
+produced it:
+
+```json
+{
+  "success": true,
+  "data": [ … ],
+  "_scope": {
+    "project": "default",
+    "zone": "trailblaze",
+    "note": "results are limited to this project; it is fixed by the api_keys row behind MONITOR_API_KEY …"
+  }
+}
+```
+
+It is resolved once per process and reused, so it costs one request at startup rather
+than one per call. If it cannot be resolved, `project` is `null` with a note saying so —
+the answer still comes back; only the label is missing.
+
+Responses that carry **no** `_scope` are the ones that are not per-project in the first
+place: health, the zone/project registry, service→repo mappings, alert rules,
+notification channels and alert history are install-wide configuration, shared by every
+project.
+
+**To read a second project, add a second entry** with a key bound to it:
+
+```json
+{
+  "mcpServers": {
+    "monitor": {
+      "command": "npx",
+      "args": ["-y", "monitor-mcp"],
+      "env": { "MONITOR_API_URL": "https://api.monitor.appleby.cloud", "MONITOR_API_KEY": "key-for-default" }
+    },
+    "monitor-atlas": {
+      "command": "npx",
+      "args": ["-y", "monitor-mcp"],
+      "env": { "MONITOR_API_URL": "https://api.monitor.appleby.cloud", "MONITOR_API_KEY": "key-for-atlas" }
+    }
+  }
+}
+```
+
+Another **zone** works the same way, with its own `MONITOR_API_URL` as well as its own key.
+Use `monitor_list_zones` and `monitor_list_projects` to see what exists.
 
 ## Secret values are masked
 

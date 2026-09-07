@@ -70,7 +70,15 @@ if (!API_URL || !API_KEY) {
 
 // --- API helper ---
 
+// api() is the one chokepoint every tool goes through: httpRequest does the call
+// and the masking, withProjectScope annotates the answer with the project that
+// produced it. Both halves are central rather than per-tool, so a newly added
+// tool is masked and scope-labelled by default rather than by remembering.
 async function api(method, path, params, body) {
+    return withProjectScope(path, await httpRequest(method, path, params, body));
+}
+
+async function httpRequest(method, path, params, body) {
     // Preserve any base path on API_URL (e.g. https://host/basepath) by
     // concatenating the trimmed base with the leading-slash path, rather than
     // using new URL(path, base) which discards the base's path for absolute paths.
@@ -132,6 +140,155 @@ async function api(method, path, params, body) {
     }
 }
 
+// --- Project scope (multi-tenancy) ---
+//
+// THERE IS NO `project` PARAMETER ON ANY TOOL, AND ADDING ONE WOULD BE A BUG.
+//
+// Monitor is multi-tenant: every event carries a `project`, stamped server-side
+// at ingest from the api_keys row behind the presented key. The READ side works
+// the same way. In `monitor-core/middleware/query_auth.go`, the DB admin-key
+// branch of QueryAuthMiddleware resolves the tenant from that key's OWN row —
+// `scope.WithProject(ctx, identity.ProjectSlug)` — and deliberately ignores any
+// `?project` on the request. Its comment says why: "admin" is a scope over VERBS
+// (query vs. ingest), never over tenants, so an admin key reads only its own
+// project and a request-supplied slug must never be able to move a real
+// boundary. A `project` sent from here does not even reach that decision; it
+// arrives as an ordinary filter column that can narrow the mandatory predicate
+// and never widen it.
+//
+// So a `project` parameter on these tools would be AN INPUT THE HANDLER SILENTLY
+// IGNORES: the model would pass "atlas", the server would answer for the key's
+// own project, and neither side would say anything. That is precisely the class
+// of defect every bug shipped across the five *-mcp servers has come from —
+// wrong units, wrong enum values, wrong content type, or a parameter the handler
+// ignores.
+//
+// TO READ ANOTHER PROJECT, ADD A SECOND `~/.mcp.json` ENTRY whose
+// MONITOR_API_KEY is a key bound to that project (e.g. a "monitor-atlas" server
+// alongside "monitor"). That is the same asymmetry that already makes zones
+// free: a zone is a whole monitor-core install with its own URL and its own
+// keys, so it is a second entry too. monitor-web *does* get a `?project`
+// selector — see withSessionProject in the same middleware file — but that is a
+// session, which has no credential-side tenant to derive; this server
+// authenticates with a credential that does.
+//
+// What this server does instead is say which project answered — see below.
+
+// The project (and zone) this server's credential reads, resolved once and
+// reused for the process lifetime.
+//
+// Resolved from GET /v1/api-keys, which is not an inference: apikeys.List filters
+// that listing by the project QueryAuthMiddleware resolved for the request, and
+// every row carries that project's slug, so the value read back IS the server's
+// own answer to "whose data am I reading?" — the same context value every event
+// query is scoped by. Nothing echoes it more directly: an API key has no /self,
+// and monitor-core sets no project response header. Note the install's
+// `default_project_slug` (from monitor_list_projects) is NOT this: that is what
+// an unset selector resolves to for a browser session, and a key bound to a
+// non-default project answers for its own regardless.
+//
+// Cached as a single promise INCLUDING WHEN IT FAILS. Resolving per call would
+// double the request count of every tool; retrying after a failure would do that
+// forever on an install where the label simply cannot be read. A label must
+// never cost more than the answer it labels, and must never withhold one — an
+// unresolved scope degrades to a note, never to an error.
+let scopePromise = null;
+
+function projectScope() {
+    if (!scopePromise) scopePromise = resolveProjectScope();
+    return scopePromise;
+}
+
+async function resolveProjectScope() {
+    const [keys, zones] = await Promise.all([
+        httpRequest("GET", "/v1/api-keys"),
+        httpRequest("GET", "/v1/zones"),
+    ]);
+
+    const keyRows = Array.isArray(keys?.data) ? keys.data : [];
+    const project = keyRows
+        .map((k) => k?.project_slug)
+        .find((slug) => typeof slug === "string" && slug !== "");
+
+    if (!project) {
+        // Honest about the gap rather than silent about it: the answers above are
+        // still scoped, the label for that scope is just unavailable.
+        const reason = keys?.success === false
+            ? `HTTP ${keys.http_status ?? "error"}`
+            : "no key rows returned";
+        return {
+            project: null,
+            note: `answering project could not be resolved (GET /v1/api-keys: ${reason}); results are still scoped to whichever project MONITOR_API_KEY is bound to`,
+        };
+    }
+
+    const scope = {
+        project,
+        note: "events, issues and analytics answers are limited to this project. It is fixed by the api_keys row behind MONITOR_API_KEY and cannot be selected per request — reach another project with a second ~/.mcp.json entry whose key is bound to it.",
+    };
+
+    // The zone only when there is exactly one. A project slug is unique within
+    // its zone rather than globally, so naming the zone disambiguates the label —
+    // but the registry lists every zone the install knows about while this URL
+    // serves one, and guessing which would be worse than omitting it.
+    const zoneRows = Array.isArray(zones?.data) ? zones.data : [];
+    if (zoneRows.length === 1 && typeof zoneRows[0]?.slug === "string" && zoneRows[0].slug !== "") {
+        scope.zone = zoneRows[0].slug;
+    }
+
+    return scope;
+}
+
+// The /v1 paths that are NOT project-scoped, and so must NOT be labelled. A
+// label on one of these would assert a filter that is not there — a "wrong
+// answer that looks right", which is the failure the label exists to prevent, so
+// silence is the only honest option.
+//
+// The list is a DENYLIST on purpose: a newly added tool is labelled by default,
+// the same way sanitise() masks by default. If you add a tool for a route that
+// reads global configuration rather than a tenant's data, add its path here —
+// the check is whether the handler's chain reaches scope.ProjectPredicate,
+// scopeIssues or apikeys.List in monitor-core.
+//
+// Verified against monitor-core 9cab9e2:
+//   zones/projects       registry reads (query.ListZones / ListProjects), no project filter
+//   service-repos        one service→repo mapping serves every project
+//   alert-rules (config) rules, channels and history are global rows in MariaDB
+//   dashboards, views    UI persistence, no tool today, listed so a future one starts right
+//
+// `/v1/alert-rules/{id}/test` is deliberately NOT exempt, which is why the
+// alert-rules pattern stops at one path segment: the rule row is global, but
+// testing one EVALUATES it, and alerts/evaluator.go:335 applies
+// scope.ProjectPredicate to that read — so the value returned is this project's.
+const SCOPE_ECHO_EXEMPT = [
+    /^\/v1\/zones(\/|$)/,
+    /^\/v1\/service-repos(\/|$)/,
+    /^\/v1\/notification-channels(\/|$)/,
+    /^\/v1\/alert-history(\/|$)/,
+    /^\/v1\/(dashboards|views)(\/|$)/,
+    /^\/v1\/alert-rules(\/[^/]+)?$/,
+];
+
+// Annotates a project-scoped response with the scope that produced it, under a
+// leading-underscore key so it reads as this server's annotation and not as a
+// field monitor-core returned.
+async function withProjectScope(path, payload) {
+    const p = path.startsWith("/") ? path : "/" + path;
+
+    // /health, /auth/* and /admin/* are not project-scoped surfaces.
+    if (!p.startsWith("/v1/")) return payload;
+    if (SCOPE_ECHO_EXEMPT.some((re) => re.test(p))) return payload;
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return payload;
+
+    try {
+        const scope = await projectScope();
+        return scope ? { ...payload, _scope: scope } : payload;
+    } catch {
+        // Never let the label break the query it was labelling.
+        return payload;
+    }
+}
+
 function text(data) {
     return [{ type: "text", text: JSON.stringify(data, null, 2) }];
 }
@@ -179,17 +336,29 @@ const SECRET_FIELDS = new Set([
 const OPAQUE_FIELDS = new Set(["data", "context", "extra", "tags"]);
 
 // Walks a decoded response and masks every sensitive value in place.
-function sanitise(node) {
+//
+// `depth` exists because `data` names two different things. monitor-core's
+// responder wraps EVERY payload as {success, message, data, pagination}, so the
+// ROOT `data` is the envelope — the whole response body — while a `data` inside
+// a row is the free-form event payload OPAQUE_FIELDS is meant to skip. Treating
+// both alike made the exemption swallow the entire response, so nothing was ever
+// masked against a real monitor-core: monitor_create_api_key returned its live
+// admin key in full, past the mask this block exists to apply. The opaque rule
+// therefore applies only BELOW the envelope.
+function sanitise(node, depth = 0) {
     if (ALLOW_SECRETS || node === null || typeof node !== "object") return node;
-    if (Array.isArray(node)) return node.map(sanitise);
+    // An array is not a naming level — its rows sit at the depth the array
+    // itself did, so an event row's own `data` is still opaque. Mapped through a
+    // lambda rather than `map(sanitise)`, which would pass the index as `depth`.
+    if (Array.isArray(node)) return node.map((item) => sanitise(item, depth));
     const out = {};
     for (const [k, v] of Object.entries(node)) {
-        if (OPAQUE_FIELDS.has(k)) {
+        if (OPAQUE_FIELDS.has(k) && depth > 0) {
             out[k] = v;
         } else if (SECRET_FIELDS.has(k) && typeof v === "string") {
             out[k] = mask(v);
         } else {
-            out[k] = sanitise(v);
+            out[k] = sanitise(v, depth + 1);
         }
     }
     return out;
@@ -208,6 +377,47 @@ server.tool("monitor_health", "Check Monitor API health — returns queue stats 
     const res = await api("GET", "/health");
     return { content: text(res) };
 });
+
+// ==================== ZONES & PROJECTS (TENANCY) ====================
+//
+// A ZONE is one whole monitor-core install — its own ClickHouse instance, its own
+// URL, its own API keys. A PROJECT is a tenant inside one zone, and is the
+// dimension every event is filed under. Both routes are reads with no
+// create/update/delete counterpart: the registry is seeded by
+// bootstrap.EnsureZoneAndProject and managed out of band, and slugs are immutable
+// and never reusable, so a mistyped one could only ever be retired.
+//
+// These two are the only /v1 tools whose responses carry no `_scope`
+// annotation — they answer about the install's registry, not about the project
+// this server's key reads. See the project-scope block above for why no tool
+// takes a `project` parameter.
+
+server.tool(
+    "monitor_list_zones",
+    "List the zones this Monitor install knows about (GET /v1/zones). A zone is one whole monitor-core deployment — its own ClickHouse instance, URL and API keys — and every project lives inside exactly one zone. Retired zones are excluded. A single-zone install returns exactly ONE row: that is what a single-zone install looks like, not a bug. Read-only — zones are seeded out of band and their slugs are immutable, so there is no create/update/delete.",
+    {
+        limit: z.number().optional().describe("Max zones to return, 1-500. Omit to get them all — this route asks for 500 by default rather than the usual 50. An out-of-range value is REFUSED with a 400, never clamped."),
+        offset: z.number().optional().describe("Pagination offset. Must not be negative — a negative value is refused with a 400."),
+    },
+    async ({ limit, offset }) => {
+        const res = await api("GET", "/v1/zones", { limit, offset });
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_list_projects",
+    "List the active projects inside one zone (GET /v1/zones/{zone}/projects). A project is the tenant every event is filed under. Returns an OBJECT, not a bare array: {\"projects\": [...], \"default_project_slug\": \"...\"}. default_project_slug is a property of the INSTALL — the project an unset selector resolves to for a browser session — and is NOT necessarily the project this server reads: an API key answers only for the project named by its own api_keys row, which every other tool reports back in the `_scope` field. An unknown zone is a 404. Read-only — projects are seeded out of band and their slugs are immutable.",
+    {
+        zone: z.string().describe("Zone slug (path segment) — get it from monitor_list_zones. Required, because a project slug is unique only WITHIN its zone."),
+        limit: z.number().optional().describe("Max projects to return, 1-500. Omit to get them all — this route asks for 500 by default rather than the usual 50. An out-of-range value is REFUSED with a 400, never clamped."),
+        offset: z.number().optional().describe("Pagination offset. Must not be negative — a negative value is refused with a 400."),
+    },
+    async ({ zone, limit, offset }) => {
+        const res = await api("GET", `/v1/zones/${encodeURIComponent(zone)}/projects`, { limit, offset });
+        return { content: text(res) };
+    }
+);
 
 // ==================== SERVICE DISCOVERY ====================
 

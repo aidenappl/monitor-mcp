@@ -22,7 +22,7 @@ It **owns**: the tool definitions, their JSON schemas, and the HTTP mapping to
 
 ## 2. Stack & dependencies
 
-- Node ESM, single file `index.js` (~960 lines).
+- Node ESM, single file `index.js` (~1560 lines).
 - `@modelcontextprotocol/sdk` (MCP server) + `zod` (tool input schemas).
 - Talks to `monitor-core` over `fetch` (native).
 
@@ -65,7 +65,8 @@ request shape from a description or a struct.** Every bug shipped across the fiv
 servers came from that: wrong units, wrong enum values, wrong content type, or params
 the handler silently ignores. The relevant handlers live in
 `monitor-core/routes/*.go`, `monitor-core/alerts/alerts.go`, and
-`monitor-core/services/query.go`. The route table is `monitor-core/main.go:155-242`.
+`monitor-core/services/query.go`. The route table is `monitor-core/main.go:237-374` (as of
+monitor-core `9cab9e2`); tenancy enforcement is `monitor-core/middleware/query_auth.go`.
 
 Shape rules verified correct in this repo (keep them):
 - **Auth:** every request sends `X-Api-Key: <MONITOR_API_KEY>`. This must
@@ -89,13 +90,32 @@ Shape rules verified correct in this repo (keep them):
   admin/ingest; label names ∈ service/env/name/level/user_id.
 - **Body vs query:** analytics/timeseries/topn/gauge/compare are POST-body; events/labels/
   data/trace/request are GET-query; issue/api-key/alert-rule mutations use path + body.
+- **Tenancy:** no tool takes a `project`, and adding one would be a silently-ignored
+  input. The project is derived from the api_keys row behind `MONITOR_API_KEY`. Full
+  reasoning in **§6a** — read it before touching anything project-shaped.
 
 **House rule:** any new `monitor-core` `/v1/*` route should add or consciously skip a
 tool here in the same change. See §7 for the current gaps.
 
 ---
 
-## 6. Tool inventory (53 tools)
+## 6. Tool inventory (55 tools)
+
+Tenancy/registry (added 2026-09-07, verified against
+`monitor-core/routes/HandleListZones.router.go` and `HandleListProjects.router.go`):
+`monitor_list_zones` (GET /v1/zones), `monitor_list_projects`
+(GET /v1/zones/{zone}/projects). Three things to get right, all from the handlers:
+
+- **`monitor_list_projects` returns an OBJECT, not an array** —
+  `{"projects": [...], "default_project_slug": "..."}` (`ListProjectsResponse`). The
+  default is a property of the INSTALL (`env.DefaultProjectSlug`), not of a row, and is
+  **not** necessarily the project this server reads — see §6a.
+- **`limit`/`offset` are REFUSED, not clamped.** `registryListPage` 400s on a
+  non-integer, on `limit <= 0 || limit > 500`, and on a negative offset. Omitting `limit`
+  asks for `db.MAX_LIMIT` (500), not the usual `DEFAULT_LIMIT` (50), deliberately: a 51st
+  project silently missing from a switcher is a tenant nobody can reach.
+- **The `zone` is a path segment and is required** — a project slug is unique only within
+  its zone.
 
 Discovery/query: `monitor_health`, `monitor_list_services|environments|event_names|
 levels|users`, `monitor_get_data_keys|data_values`, `monitor_search_events`,
@@ -157,6 +177,81 @@ The first 36 methods/paths/enums verified against the live `monitor-core` handle
 
 ---
 
+## 6a. Tenancy — which project answers, and why no tool takes a `project`
+
+Monitor is multi-tenant. A **zone** is one whole `monitor-core` install (its own
+ClickHouse, its own URL, its own keys); a **project** is a tenant inside a zone, and is
+the dimension every event is filed under. `Event.Project` is stamped **server-side** at
+ingest from the `api_keys` row behind the presented key and overwritten over whatever
+the client sent.
+
+**Do not add a `project` parameter to any tool. It would be an input the handler
+silently ignores.**
+
+The claim is checkable in `monitor-core/middleware/query_auth.go`. In
+`QueryAuthMiddleware`, the DB admin-key branch resolves the tenant from that key's own
+row — `scope.WithProject(ctx, identity.ProjectSlug)` — and ignores any `?project` on the
+request. Its comment states the rule: an admin key reads **only** its own project,
+because "admin" is a scope over VERBS (query vs. ingest) and never over tenants, and a
+request-supplied slug must never be able to move a real boundary. A `project` sent from
+here never reaches that decision at all; it lands as an ordinary filter column ANDed onto
+the mandatory predicate, so it can only narrow a result, never widen one. The model would
+pass `atlas`, the server would answer for the key's own project, and nothing on either
+side would say so — the exact failure mode §5 names as the source of every bug shipped
+across the five MCP servers.
+
+**To read another project, add a second `~/.mcp.json` entry** whose `MONITOR_API_KEY` is
+a key bound to that project (`monitor-atlas` alongside `monitor`). Keys are created per
+project — `POST /v1/api-keys` takes an optional `project_slug`, defaulting to the install
+default. This is the same asymmetry that already makes zones free: a zone is a separate
+install with its own URL, so it is a separate entry too.
+
+`monitor-web` *does* offer a `?project` selector, and that is not a contradiction:
+`withSessionProject` in the same file resolves it for **sessions**, which have no
+credential-side tenant to derive from. An API key does. (That selector is also explicitly
+*not* a boundary — Monitor has no per-user membership table — which the middleware's
+"project asymmetry" register spells out.)
+
+### The `_scope` echo
+
+Because the scope is invisible from the outside, `api()` annotates project-scoped
+responses with the project that produced them:
+
+```json
+"_scope": { "project": "default", "zone": "trailblaze", "note": "results are limited to this project; …" }
+```
+
+- **Where:** in `withProjectScope()`, called from `api()` — the same chokepoint
+  `sanitise()` uses, so a newly added tool is labelled by default rather than by
+  remembering. The leading underscore marks it as this server's annotation, not a
+  `monitor-core` field.
+- **What is exempt:** anything not under `/v1/`, plus the `/v1` surfaces that are global
+  configuration rather than tenant data — `SCOPE_ECHO_EXEMPT` in `index.js` lists them
+  with the reason: `zones`/`projects` (registry), `service-repos` (one mapping serves
+  every project), `alert-rules` (the rule rows), `notification-channels`, `alert-history`,
+  and `dashboards`/`views`. Labelling one of those would assert a filter that is not
+  there. It is a **denylist**, so a new tool is labelled by default; if you add one for a
+  global-config route, add its path. The test is whether the handler's chain in
+  `monitor-core` reaches `scope.ProjectPredicate`, `scopeIssues` or `apikeys.List`.
+- **`POST /v1/alert-rules/{id}/test` is NOT exempt**, which is why the alert-rules pattern
+  stops at one path segment. The rule row is global, but testing one *evaluates* it, and
+  `alerts/evaluator.go:335` scopes that read — so the value returned is this project's.
+- **How it is resolved:** one `GET /v1/api-keys`. That is not an inference —
+  `apikeys.List` filters the listing by the project `QueryAuthMiddleware` resolved for the
+  request, so the `project_slug` read back **is** the server's own answer to "whose data
+  am I reading?". An API key has no `/self` and `monitor-core` sets no project header, so
+  nothing echoes it more directly. `GET /v1/zones` runs alongside it and supplies `zone`
+  only when the install has exactly one.
+- **Cached for the process lifetime, including on failure.** Resolving per call would
+  double every tool's request count; retrying after a failure would do that forever on an
+  install where the label simply cannot be read.
+- **Degrades, never breaks.** An unresolved scope becomes
+  `{"project": null, "note": "answering project could not be resolved (…)"}` and the tool
+  still returns its answer. Verified by running with a deliberately invalid key: the tool
+  returned the API's 401 body plus the note, and nothing threw.
+
+---
+
 ## 7. Coverage gaps (routes with no tool)
 
 Per the house rule, these `monitor-core` routes have **no MCP tool** — decide add-or-skip:
@@ -208,6 +303,17 @@ noise without producing safety. If a service logs a secret into an event, it wil
 here — **that is a bug in the emitting service and the fix belongs there**, not in a guess about
 payload shape.
 
+⚠️ **That exemption applies only BELOW the response envelope, and the `depth` parameter on
+`sanitise()` is what enforces it — do not remove it.** `data` names two different things:
+`monitor-core`'s responder wraps *every* payload as `{success, message, data, pagination}`, so the
+**root** `data` is the whole response body, while a `data` *inside a row* is the free-form event
+payload. Skipping both alike made the exemption swallow the entire response — nothing was masked
+against a real `monitor-core`, and `monitor_create_api_key` returned its live admin key in full,
+straight past the mask above. Hence `OPAQUE_FIELDS.has(k) && depth > 0`, and hence the array branch
+maps through a lambda rather than `map(sanitise)`, which would pass the array index as `depth`.
+Verify with the two cases together: a created key must come back `mo**********`, and an event's
+`data` payload must come back untouched.
+
 `MONITOR_ALLOW_SECRET_VALUES=1` disables masking. It is off by default and should stay that way.
 
 ---
@@ -219,9 +325,19 @@ payload shape.
 - Keep `query_filters`/`notification_channel_ids` as JSON strings.
 - `server.version` is read from `package.json` at startup — bump only `package.json`.
 - Any new `monitor-core` route → add or consciously skip a tool here.
+- **Never add a `project` parameter to a tool** (§6a). `monitor-core`'s
+  `middleware/query_auth.go` derives the project from the `api_keys` row behind
+  `MONITOR_API_KEY` and ignores a request-supplied one, so the parameter would be
+  silently ignored. Reaching another project is a second `~/.mcp.json` entry with a key
+  bound to it.
+- **Keep the `_scope` echo central and non-fatal** (§6a) — resolved once in
+  `withProjectScope()`/`api()`, cached for the process lifetime, and degrading to a note
+  rather than an error when it cannot be resolved.
 - **Never weaken `sanitise()`** (§8a) — it must stay recursive, applied centrally in `api()`, and
   on by default. If something genuinely needs a real value, the answer is
-  `MONITOR_ALLOW_SECRET_VALUES=1` in that server's env, not an exemption in the code.
+  `MONITOR_ALLOW_SECRET_VALUES=1` in that server's env, not an exemption in the code. In
+  particular, **keep the `depth` parameter**: without it the `data` exemption matches the
+  responder envelope and silently disables masking for every route.
 
 **Known issues & gaps** — all resolved in the 2026-07-23 fix pass (kept here for traceability):
 
@@ -238,10 +354,28 @@ payload shape.
 
 ## 10. Verification
 
-`node index.js --setup` (writes config) and a manual smoke test against a running
-`monitor-core` with a valid **admin-scope** key. There is no automated test suite; when
-adding a tool, verify the request against the real handler (§5) and exercise it once
-end-to-end before publishing.
+There is no build step and no automated test suite, so verification is three things:
+
+```bash
+node --check index.js                 # must pass
+grep -c 'server.tool(' index.js       # must match the count in §6 (55)
+```
+
+…plus a **manual end-to-end smoke test** against a running `monitor-core` with a valid
+**admin-scope** key: drive `index.js` over stdio (`initialize`, `notifications/initialized`,
+`tools/list`, then `tools/call`) and exercise the tool you changed. When adding a tool,
+verify the request against the real handler (§5) first — reading the handler is what
+catches the parameters the API ignores, and the smoke test is what catches the rest.
+
+Last verified 2026-09-07 against `https://api.monitor.appleby.cloud`: 55 tools listed;
+`monitor_list_zones` → one active zone (`trailblaze`); `monitor_list_projects` →
+`{"projects": [default], "default_project_slug": "default"}`; `limit=9999` refused with
+`400 limit must be between 1 and 500` (proving the route refuses rather than clamps);
+`monitor_list_services`, `monitor_list_issues` and `monitor_list_api_keys` carried
+`_scope {project: "default", zone: "trailblaze"}`; `monitor_health`, the two registry
+tools, `monitor_list_service_repos` and `monitor_list_alert_rules` carried none. Re-run
+with a deliberately invalid key: every tool still answered, with
+`_scope {project: null, note: "…GET /v1/api-keys: HTTP 401…"}`.
 
 ---
 
