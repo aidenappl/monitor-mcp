@@ -22,7 +22,7 @@ It **owns**: the tool definitions, their JSON schemas, and the HTTP mapping to
 
 ## 2. Stack & dependencies
 
-- Node ESM, single file `index.js` (~1560 lines).
+- Node ESM, single file `index.js` (~1785 lines).
 - `@modelcontextprotocol/sdk` (MCP server) + `zod` (tool input schemas).
 - Talks to `monitor-core` over `fetch` (native).
 
@@ -93,6 +93,11 @@ Shape rules verified correct in this repo (keep them):
 - **Tenancy:** no tool takes a `project`, and adding one would be a silently-ignored
   input. The project is derived from the api_keys row behind `MONITOR_API_KEY`. Full
   reasoning in **§6a** — read it before touching anything project-shaped.
+- **Zone is the opposite case.** Every zone-binding WRITE tool takes a **required `zone`**,
+  which is **verified and never forwarded** — `requireZone()` compares it with `zone` from
+  `GET /health` and refuses the call, unsent, on a mismatch. This is not a contradiction of
+  the rule above: `project` would be an input nothing reads, `zone` is an assertion this
+  server checks itself. Full reasoning in **§6b** — read it before removing the parameter.
 
 **House rule:** any new `monitor-core` `/v1/*` route should add or consciously skip a
 tool here in the same change. See §7 for the current gaps.
@@ -116,6 +121,11 @@ Tenancy/registry (added 2026-09-07, verified against
   project silently missing from a switcher is a tenant nobody can reach.
 - **The `zone` is a path segment and is required** — a project slug is unique only within
   its zone.
+- **Neither route identifies the process serving it.** Both read the registry table in the
+  ANSWERING process's own MariaDB, so the control plane returns the whole fleet and a zone
+  returns its own row, in an identical response shape. `monitor_list_zones`' description
+  therefore points the reader at `_scope.zone` / `monitor_health` instead — keep that
+  wording. Counting rows here is exactly the bug §6a describes.
 
 Discovery/query: `monitor_health`, `monitor_list_services|environments|event_names|
 levels|users`, `monitor_get_data_keys|data_values`, `monitor_search_events`,
@@ -157,6 +167,12 @@ Alerts: `monitor_list_alert_rules`, `monitor_test_alert_rule`, `monitor_create_a
 
 Notification channels: `monitor_list_notification_channels`,
 `monitor_create_notification_channel`, `monitor_delete_notification_channel`.
+
+**Twelve of the tools above take a required, verified `zone`** — `monitor_create_api_key`
+and `monitor_delete_api_key`, the three alert-rule mutations, the two notification-channel
+mutations, the two service-repo mutations and the three SSO-provider mutations. It is
+checked against `GET /health` and never forwarded; see **§6b** before adding, removing or
+copying it.
 
 SSO / auth (added 2026-07-24, verified against `monitor-core/routes/HandleSSOConfig.router.go`,
 `HandleAdminSSOProviders.router.go`, `HandleGetSelf.router.go` + `RegisterSSORoutes.go`):
@@ -215,11 +231,20 @@ credential-side tenant to derive from. An API key does. (That selector is also e
 ### The `_scope` echo
 
 Because the scope is invisible from the outside, `api()` annotates project-scoped
-responses with the project that produced them:
+responses with the zone, project and URL that produced them:
 
 ```json
-"_scope": { "project": "default", "zone": "trailblaze", "note": "results are limited to this project; …" }
+"_scope": {
+  "zone": "trailblaze",
+  "role": "both",
+  "project": "default",
+  "api_url": "https://api.monitor.appleby.cloud",
+  "note": "events, issues and analytics answers are limited to this project; …"
+}
 ```
+
+Three facts, deliberately: **which zone answered, whose data it answered with, and where
+to look.** No single monitor-core response field carries all three.
 
 - **Where:** in `withProjectScope()`, called from `api()` — the same chokepoint
   `sanitise()` uses, so a newly added tool is labelled by default rather than by
@@ -236,19 +261,114 @@ responses with the project that produced them:
 - **`POST /v1/alert-rules/{id}/test` is NOT exempt**, which is why the alert-rules pattern
   stops at one path segment. The rule row is global, but testing one *evaluates* it, and
   `alerts/evaluator.go:335` scopes that read — so the value returned is this project's.
-- **How it is resolved:** one `GET /v1/api-keys`. That is not an inference —
+- **How `project` is resolved:** one `GET /v1/api-keys`. That is not an inference —
   `apikeys.List` filters the listing by the project `QueryAuthMiddleware` resolved for the
   request, so the `project_slug` read back **is** the server's own answer to "whose data
   am I reading?". An API key has no `/self` and `monitor-core` sets no project header, so
-  nothing echoes it more directly. `GET /v1/zones` runs alongside it and supplies `zone`
-  only when the install has exactly one.
-- **Cached for the process lifetime, including on failure.** Resolving per call would
-  double every tool's request count; retrying after a failure would do that forever on an
-  install where the label simply cannot be read.
-- **Degrades, never breaks.** An unresolved scope becomes
-  `{"project": null, "note": "answering project could not be resolved (…)"}` and the tool
-  still returns its answer. Verified by running with a deliberately invalid key: the tool
-  returned the API's 401 body plus the note, and nothing threw.
+  nothing echoes it more directly.
+- **How `zone` and `role` are resolved: one `GET /health`, and it must stay that way.**
+  `/health` reports `zone` (from `env.ZoneSlug`) and `role` as the **answering process's
+  own identity** — unauthenticated, and put there for exactly this purpose; the handler
+  comment in `routes/events.go` says it exists so a caller can tell "a monitor-core
+  answered" from "the monitor-core I meant answered", and `probe.Zone` compares registry
+  rows against it. It is correct whether the URL points at the control plane or at a zone.
+  ⚠️ **This previously read `GET /v1/zones` and used the slug only when the listing had
+  exactly ONE row.** That is a registry LISTING, not an identity: the moment a second zone
+  was registered the count stopped being one and `zone` silently disappeared from every
+  `_scope` — at precisely the moment multi-zone made it load-bearing. A fleet-wide
+  registry can never identify the process serving it. Do not go back.
+- **`api_url` is the configured `MONITOR_API_URL`,** echoed verbatim. It costs nothing and
+  closes the last ambiguity about which deployment produced an answer.
+- **Cached with a TTL, including on failure** — `SCOPE_TTL_MS` (5 min) on a fully-resolved
+  scope, `SCOPE_FAILURE_TTL_MS` (30 s) otherwise. Resolving per call would double every
+  tool's request count, and retrying immediately after a failure would do that forever on
+  an install where the label cannot be read — but the earlier "cache forever" made a
+  long-running server report the fleet it *booted into*: a process started when there was
+  one zone kept answering from that snapshot for days, uncorrectable short of a restart.
+  The short TTL is stamped **before** the request and extended only once a complete answer
+  returns, so a rejected, hanging or partial resolve expires quickly. `Date.now()` is read
+  at call time only — never inside a module-level constant, which would freeze the clock at
+  import.
+- **Degrades per half, never breaks.** An unresolved project is `{"project": null, …}`;
+  an unresolved zone is simply absent. Each adds its own sentence to `note` and the tool
+  still returns its answer. Verified against a stub returning `500` on `/health`: the read
+  carried `project` plus a note naming the gap, nothing threw, and the label healed by
+  itself 30 s later once the stub recovered.
+
+---
+
+## 6b. Zone verification on writes — why `zone` is a parameter and `project` is not
+
+**§6a is about `project`. None of it transfers to `zone`, and reading it as though it did
+is how someone deletes a parameter that is load-bearing.**
+
+A project is chosen by a **credential inside one process**: the slug never reaches a
+decision, so a parameter for it is a parameter the handler ignores. A zone is a **whole
+separate process** — own binary, own ClickHouse, own MariaDB, own URL — so which zone
+answers is settled by `MONITOR_API_URL` before a request is sent. That makes the zone
+*checkable*, and on writes it makes checking it *necessary*.
+
+**The failure it prevents.** `monitor-core`'s `apikeys.resolveProject` (`apikeys/apikeys.go`)
+resolves the zone from `env.ZoneSlug` — the **answering** process's own env — and looks the
+project up in that zone. Point this server at the control plane, ask for an ingest key "for
+appleby", and you get `200 OK` with a key bound to a **trailblaze** project. The service
+wired to it then reports into the wrong tenant, permanently, with nothing on either side
+saying so. Every other write here has the same shape: alert rules, notification channels,
+service→repo mappings and SSO providers are rows in the answering zone's own MariaDB and
+none of them names a zone in its body.
+
+**The mechanism.** `requireZone(zone)` resolves the actual zone through the `§6a` memo (so
+the check costs nothing per call) and:
+
+- returns `null` when they match — call sites read `const refusal = await requireZone(zone);
+  if (refusal) return refusal;`
+- returns a finished **`isError`** tool result on a mismatch (`error: "zone_mismatch"`),
+  naming the requested zone, the actual zone, the URL, and what to do instead. A refusal
+  rather than a thrown exception because the model must be able to read *why*.
+- **fails closed** when the zone cannot be read at all (`error: "zone_unverifiable"`).
+  The asymmetry with the `_scope` label is deliberate: a missing label costs a re-read, an
+  unverified write is the exact failure this exists to prevent and it cannot be undone. The
+  30 s failure TTL bounds a transient `/health` outage to a brief block, not a dead server.
+
+**It is VERIFIED, NEVER ROUTED.** `zone` is destructured out before any body is built, is
+never put in a body or query string, and cannot make a request go anywhere. That is the
+whole difference from `project` in one line: `project` would be an input nothing reads,
+`zone` is an assertion this server checks itself.
+
+**Which tools take it** (12) — everything that creates or changes a row in a zone:
+
+| Tool(s) | Binds |
+|---|---|
+| `monitor_create_api_key` | a key to a project in the answering zone |
+| `monitor_delete_api_key` | revokes a key **in the answering zone** — the destructive one; see below |
+| `monitor_create_alert_rule`, `monitor_update_alert_rule`, `monitor_delete_alert_rule` | rule rows in the answering zone's MariaDB |
+| `monitor_create_notification_channel`, `monitor_delete_notification_channel` | channel rows, same |
+| `monitor_set_service_repo`, `monitor_delete_service_repo` | the service→repo mapping for that zone only |
+| `monitor_create_sso_provider`, `monitor_update_sso_provider`, `monitor_delete_sso_provider` | who may sign in to that zone |
+
+**Reads do NOT take it** and must not gain it — they carry `_scope` instead, and a
+required argument on 43 read tools would be cost without safety. `monitor_list_projects`'s
+`zone` is unrelated: that one is a genuine path segment the route needs.
+
+**`monitor_delete_api_key` is guarded even though the argument for skipping it is sound.**
+Key IDs are UUIDs, so an ID copied from another zone's listing all but certainly 404s
+rather than revoking a live key, and in practice the ID comes from `monitor_list_api_keys`
+on this same connection. It is guarded anyway, and the reasons are worth keeping written
+down: it is the one **destructive** verb in the set — revoking an ingest key stops a
+tenant's services reporting, and the only symptom is a 401 at the producer with nothing in
+Monitor to explain it — and "almost certainly 404s" is a probability argument guarding an
+irreversible action. The second reason is **consistency as a safety property in itself**: a
+`create_api_key` that requires a zone beside a `delete_api_key` that does not reads as
+"deletes are zone-safe by construction", when they would only ever have been zone-safe by
+UUID collision odds.
+
+Not covered: the issue-mutation tools (project-scoped rather than zone-binding, and their
+IDs come from a listing on this same connection), and `/v1/dashboards`, `/v1/views` and
+`/v1/notification-channels/{id}/test`, which have no write tool today — **give any future
+one a `zone`.**
+
+One shared `ZONE_PARAM_DESC` constant supplies the parameter description so twelve copies
+cannot drift.
 
 ---
 
@@ -330,16 +450,43 @@ Verify with the two cases together: a created key must come back `mo**********`,
   `MONITOR_API_KEY` and ignores a request-supplied one, so the parameter would be
   silently ignored. Reaching another project is a second `~/.mcp.json` entry with a key
   bound to it.
-- **Keep the `_scope` echo central and non-fatal** (§6a) — resolved once in
-  `withProjectScope()`/`api()`, cached for the process lifetime, and degrading to a note
+- **Keep the `_scope` echo central and non-fatal** (§6a) — resolved in
+  `withProjectScope()`/`api()`, cached with a TTL (never forever), and degrading to a note
   rather than an error when it cannot be resolved.
+- **Take `zone` from `GET /health`, never by counting `GET /v1/zones` rows** (§6a). The
+  registry is a listing; `/health` is the answering process's identity. The row-counting
+  version silently dropped `zone` from every response the day a second zone was registered.
+- **Never remove the `zone` parameter from a zone-binding write** (§6b), and never
+  "simplify" it by forwarding it to monitor-core. It is verified, not routed. Any new write
+  tool for a zone-scoped resource gets one; any new read tool does not.
 - **Never weaken `sanitise()`** (§8a) — it must stay recursive, applied centrally in `api()`, and
   on by default. If something genuinely needs a real value, the answer is
   `MONITOR_ALLOW_SECRET_VALUES=1` in that server's env, not an exemption in the code. In
   particular, **keep the `depth` parameter**: without it the `data` exemption matches the
   responder envelope and silently disables masking for every route.
 
-**Known issues & gaps** — all resolved in the 2026-07-23 fix pass (kept here for traceability):
+**Known issues & gaps**
+
+Open — both are documentation hygiene in **this file**, both were left untouched by the
+2026-09-08 pass on purpose (to keep that diff to zone safety), and both are recorded here
+so they are corrected rather than rediscovered:
+
+| ID | Sev | Where | Status |
+|---|---|---|---|
+| D1 | 🟢 | `AGENTS.md` §7 table | **Open — do not fix in a code change; fix as docs.** The `POST /v1/notification-channels/{id}/test` row writes the three tool names as one backticked alternation containing `\|` characters. GFM reads those as column separators regardless of the backticks, so the row renders with extra, empty columns. Pre-existing (it predates the zone pass). The fix is to spell the three names out comma-separated, as §6b's table does. Same trap applies to §6's prose alternations — those are safe only because they are not inside a table. |
+| D2 | 🟢 | `AGENTS.md` §3 | **Open — cosmetic.** Cites `index.js:54-58` for the "exits if `MONITOR_API_URL`/`MONITOR_API_KEY` is missing" guard. It sits at 65-69 and was already stale before the zone pass. Line-number citations into a 1800-line file drift on every edit — either re-anchor it to a symbol (`the API_URL/API_KEY guard near the top`) or drop the numbers. Worth a sweep: §5 and §6a carry similar `file:line` references into `monitor-core`. |
+
+Resolved in the 2026-09-08 zone-safety pass:
+
+| ID | Sev | Where | Status |
+|---|---|---|---|
+| Z1 | 🟡 | `monitor_delete_api_key` | ✅ **Fixed.** Initially left unguarded on the grounds that key IDs are UUIDs (a cross-zone ID 404s rather than revoking a live key). Guarded anyway: it is the one **destructive** verb in the set — revoking an ingest key silently stops a tenant reporting, visible only as a 401 at the producer — so a probability argument was guarding an irreversible action; and the inconsistency was itself a hazard, since `create_api_key` requiring a zone while `delete_api_key` did not reads as "deletes are zone-safe by construction". Reasoning kept in §6b. |
+| Z2 | 🟢 | `SCOPE_ECHO_EXEMPT` comment | ✅ **Fixed.** The comment above the zones/projects tools claimed those two are "the only /v1 tools whose responses carry no `_scope`"; there are six exempt patterns (zones/projects, service-repos, notification-channels, alert-history, alert-rules, dashboards/views). Reworded to state the real point — that a registry does not identify the process serving it. §6a's list stays the authority. |
+| Z3 | 🔴 | `resolveProjectScope()` | ✅ **Fixed.** `zone` was taken from `GET /v1/zones` only when the listing had exactly one row, so registering a second zone silently removed `_scope.zone` from every response. Now read from `GET /health`, which reports the answering process's own zone (and `role`). |
+| Z4 | 🟡 | `projectScope()` memo | ✅ **Fixed.** `if (!scopePromise)` cached the scope for the process lifetime, so a long-running server reported the fleet it booted into — one confirmed live server was still answering with a one-zone snapshot. Now 5 min on success / 30 s on failure. |
+| Z5 | 🔴 | `monitor_create_api_key` + 11 other writes | ✅ **Fixed.** `apikeys.resolveProject` binds a new key to the ANSWERING process's zone, so a key requested "for appleby" against the control plane came back bound to a trailblaze project, 200 OK, silently. All twelve zone-binding writes now take a required `zone`, verified against `/health` and refused on mismatch (§6b). |
+
+Resolved in the 2026-07-23 fix pass (kept for traceability):
 
 | ID | Sev | Where | Status |
 |---|---|---|---|
@@ -367,15 +514,28 @@ grep -c 'server.tool(' index.js       # must match the count in §6 (55)
 verify the request against the real handler (§5) first — reading the handler is what
 catches the parameters the API ignores, and the smoke test is what catches the rest.
 
-Last verified 2026-09-07 against `https://api.monitor.appleby.cloud`: 55 tools listed;
-`monitor_list_zones` → one active zone (`trailblaze`); `monitor_list_projects` →
-`{"projects": [default], "default_project_slug": "default"}`; `limit=9999` refused with
-`400 limit must be between 1 and 500` (proving the route refuses rather than clamps);
-`monitor_list_services`, `monitor_list_issues` and `monitor_list_api_keys` carried
-`_scope {project: "default", zone: "trailblaze"}`; `monitor_health`, the two registry
-tools, `monitor_list_service_repos` and `monitor_list_alert_rules` carried none. Re-run
-with a deliberately invalid key: every tool still answered, with
-`_scope {project: null, note: "…GET /v1/api-keys: HTTP 401…"}`.
+Last verified **2026-09-08** against `https://api.monitor.appleby.cloud` (the control plane,
+`role: both`, zone `trailblaze`): 55 tools listed, every `inputSchema` a valid object.
+
+- `monitor_health` → `{status: ok, role: "both", zone: "trailblaze", clickhouse_ok, mariadb_ok, alerting_ok}`.
+- `monitor_list_zones` → **TWO** active zones (`trailblaze`, `appleby`) — the fleet registry,
+  because this URL is the control plane. It is not the answer to "which zone am I on".
+- `monitor_list_services` → `_scope {zone: "trailblaze", role: "both", project: "default",
+  api_url: "https://api.monitor.appleby.cloud", note: …}`. `monitor_list_zones` carried none.
+- All 12 zone-binding writes list `zone` in their schema's `required`; all 43 other tools
+  are unchanged (`monitor_list_projects` keeps its unrelated path-segment `zone`).
+- `monitor_create_api_key {zone: "appleby"}`, `monitor_delete_api_key {zone: "appleby"}` and
+  `monitor_delete_sso_provider {zone: "does-not-exist"}` → all refused, `isError`,
+  `zone_mismatch`, naming both zones — **and no request was sent** in any of the three.
+  `monitor_update_alert_rule {zone: "trailblaze",
+  id: <all-zeros>}` → passed the guard and reached the API (`400 alert rule not found`),
+  proving the guard forwards rather than blocks on a match, and mutating nothing.
+
+TTL and degradation verified against a local stub (no production traffic): with `/health`
+returning 500, three tool calls made **one** probe and the read carried
+`project` + a note naming the gap; the write refused with `zone_unverifiable` (fail-closed);
+31 s later the next call re-probed, the stub recovered and `_scope` healed to a full label;
+two further calls made zero extra probes (the 5-minute success TTL).
 
 ---
 

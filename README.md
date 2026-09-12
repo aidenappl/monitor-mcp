@@ -36,7 +36,7 @@ Add to `~/.mcp.json`:
 ### Discovery
 | Tool | Description |
 |------|-------------|
-| `monitor_health` | API health and queue stats (enqueued, dropped, pending) |
+| `monitor_health` | API health and queue stats (enqueued, dropped, pending), plus `zone` and `role` — the answering process's own identity |
 | `monitor_list_services` | List all services sending events |
 | `monitor_list_environments` | List all environments (prod, staging, dev) |
 | `monitor_list_event_names` | List event names, optionally filtered by service |
@@ -46,12 +46,18 @@ Add to `~/.mcp.json`:
 ### Zones & Projects
 | Tool | Description |
 |------|-------------|
-| `monitor_list_zones` | The zones this install knows about — a zone is one whole Monitor deployment |
+| `monitor_list_zones` | The zones the answering process knows about — a zone is one whole Monitor deployment |
 | `monitor_list_projects` | The projects (tenants) inside one zone, plus the install's default |
 
 Both are read-only, and `monitor_list_projects` returns an object —
-`{"projects": [...], "default_project_slug": "..."}` — not a bare array. See
-[Which project you are reading](#which-project-you-are-reading).
+`{"projects": [...], "default_project_slug": "..."}` — not a bare array.
+
+**`monitor_list_zones` does not tell you which zone you are talking to.** It reads the
+registry table in the answering process's own database, so pointed at the control plane it
+returns the whole fleet and pointed at a zone it returns just that zone's row — and nothing
+in the response says which of the two happened. For your own zone, read `_scope.zone` on
+any project-scoped answer, or call `monitor_health`. See
+[Which zone and project you are reading](#which-zone-and-project-you-are-reading).
 
 ### Event Search
 | Tool | Description |
@@ -113,8 +119,8 @@ investigation resumed in a later session, avoid leaving five copies of one note.
 | Tool | Description |
 |------|-------------|
 | `monitor_list_service_repos` | Which source repository each reporting service is built from |
-| `monitor_set_service_repo` | Map a service to `owner/repo` |
-| `monitor_delete_service_repo` | Remove a mapping |
+| `monitor_set_service_repo` | Map a service to `owner/repo` — takes a required `zone` |
+| `monitor_delete_service_repo` | Remove a mapping — takes a required `zone` |
 
 Several services routinely share one repository — `auth-service-v1` and `auth-service-v2`
 are versions of one service — so the mapping is explicit rather than derived from the
@@ -149,35 +155,53 @@ Event search supports Django-style filter operators:
 
 Data fields use the `data.` prefix: `data.endpoint__contains=/api`, `data.status_code__gte=500`.
 
-## Which project you are reading
+## Which zone and project you are reading
 
-Monitor is multi-tenant. A **zone** is one whole Monitor deployment — its own storage, its
-own URL, its own API keys — and a **project** is a tenant inside a zone. Every event is
-filed under a project, stamped server-side from the API key that sent it.
+Monitor is multi-tenant. A **zone** is one whole Monitor deployment — its own process, its
+own storage, its own URL, its own API keys — and a **project** is a tenant inside a zone.
+Every event is filed under a project, stamped server-side from the API key that sent it.
+
+One server here speaks to exactly **one zone and one project**: the zone is whatever
+`MONITOR_API_URL` points at, and the project is whatever `MONITOR_API_KEY` is bound to.
 
 **Your API key decides which project you read, and nothing in a request can change it.**
 An admin key reads only the project its own key record names; "admin" is a scope over
 what you may do (query vs. ingest), not over whose data you may see. That is why no tool
 here takes a `project` argument — it would be an argument the server ignores.
 
-So every project-scoped answer carries a `_scope` annotation naming the project that
-produced it:
+So every project-scoped answer carries a `_scope` annotation naming the zone, the project
+and the URL that produced it:
 
 ```json
 {
   "success": true,
   "data": [ … ],
   "_scope": {
-    "project": "default",
     "zone": "trailblaze",
-    "note": "results are limited to this project; it is fixed by the api_keys row behind MONITOR_API_KEY …"
+    "role": "both",
+    "project": "default",
+    "api_url": "https://api.monitor.appleby.cloud",
+    "note": "events, issues and analytics answers are limited to this project …"
   }
 }
 ```
 
-It is resolved once per process and reused, so it costs one request at startup rather
-than one per call. If it cannot be resolved, `project` is `null` with a note saying so —
-the answer still comes back; only the label is missing.
+- **`zone` and `role` come from `GET /health`**, where Monitor publishes the answering
+  process's own identity. That is the only authoritative source: the zone *registry*
+  (`monitor_list_zones`) lists the zones an install knows about, which says nothing about
+  which one is answering.
+- **`project` comes from `GET /v1/api-keys`**, whose listing the server filters to the
+  project it resolved for the request — so the slug read back is its own answer to "whose
+  data am I reading?".
+- **`api_url` is the configured `MONITOR_API_URL`**, echoed so the three facts — which
+  zone, which project, which URL — are all in one place.
+
+It is resolved once and reused for about five minutes (thirty seconds if it could not be
+resolved), so it costs a request every few minutes rather than one per call, and a server
+left running for days still reports the fleet as it is now rather than as it was at boot.
+Each half degrades on its own: an unresolved project is `null` with a note, an unresolved
+zone is simply absent with a note. The answer always comes back; only the label goes
+missing.
 
 Responses that carry **no** `_scope` are the ones that are not per-project in the first
 place: health, the zone/project registry, service→repo mappings, alert rules,
@@ -205,6 +229,54 @@ project.
 
 Another **zone** works the same way, with its own `MONITOR_API_URL` as well as its own key.
 Use `monitor_list_zones` and `monitor_list_projects` to see what exists.
+
+## Writes name their zone, and it is checked
+
+Reads are labelled after the fact. Writes cannot be, because a write cannot be undone —
+so the tools that create or change something in a zone take a **required `zone`
+argument**, and refuse the call when it does not match the zone this server actually talks
+to.
+
+| Tool | |
+|------|--|
+| `monitor_create_api_key` | binds a key to a project in the answering zone |
+| `monitor_delete_api_key` | revokes a key in the answering zone — irreversible, and the producer's only symptom is a 401 |
+| `monitor_create_alert_rule` / `monitor_update_alert_rule` / `monitor_delete_alert_rule` | rules live in the answering zone's database |
+| `monitor_create_notification_channel` / `monitor_delete_notification_channel` | channels live in the answering zone's database |
+| `monitor_set_service_repo` / `monitor_delete_service_repo` | mappings serve the answering zone only |
+| `monitor_create_sso_provider` / `monitor_update_sso_provider` / `monitor_delete_sso_provider` | providers govern sign-in to the answering zone |
+
+**The argument is verified, never routed.** It is not sent to Monitor and it cannot make a
+request go anywhere; it is compared against `zone` from `GET /health` and the call is
+refused, unsent, on a mismatch. Nothing here can reach another zone — that is a different
+deployment behind a different URL.
+
+It exists because Monitor binds a write to the zone of the process that answers it, and
+says nothing about which zone that was. Ask a server pointed at the control plane for an
+ingest key "for appleby" and, without this check, you get `200 OK` and a key bound to a
+**trailblaze** project — and the service you wire it into reports into the wrong tenant
+until somebody notices an empty dashboard weeks later. Naming the zone is what turns that
+into an error message.
+
+A refusal looks like this, and the request was never sent:
+
+```json
+{
+  "success": false,
+  "error": "zone_mismatch",
+  "error_message": "refused: this MCP server talks to zone \"trailblaze\" …, not \"appleby\". The write was NOT sent.",
+  "requested_zone": "appleby",
+  "actual_zone": "trailblaze",
+  "what_to_do": "Use the ~/.mcp.json entry configured for zone \"appleby\" …"
+}
+```
+
+If the server cannot read its own zone at all — an unreachable `/health`, or a Monitor
+predating multi-zone — these writes refuse too (`zone_unverifiable`) rather than guess.
+Reads are unaffected; they just lose the `zone` half of their label.
+
+Get the value from `monitor_health` or from `_scope.zone` on any read. Do **not** take it
+from `monitor_list_zones`, which lists the zones an install knows about, not the one it is.
 
 ## Secret values are masked
 

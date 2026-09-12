@@ -173,71 +173,229 @@ async function httpRequest(method, path, params, body) {
 // authenticates with a credential that does.
 //
 // What this server does instead is say which project answered — see below.
-
-// The project (and zone) this server's credential reads, resolved once and
-// reused for the process lifetime.
 //
-// Resolved from GET /v1/api-keys, which is not an inference: apikeys.List filters
-// that listing by the project QueryAuthMiddleware resolved for the request, and
-// every row carries that project's slug, so the value read back IS the server's
-// own answer to "whose data am I reading?" — the same context value every event
-// query is scoped by. Nothing echoes it more directly: an API key has no /self,
-// and monitor-core sets no project response header. Note the install's
-// `default_project_slug` (from monitor_list_projects) is NOT this: that is what
-// an unset selector resolves to for a browser session, and a key bound to a
+// --- ZONE IS THE OPPOSITE CASE, AND THE `zone` PARAMETER ON WRITES IS NOT A BUG ---
+//
+// EVERYTHING ABOVE IS ABOUT `project`. It does NOT transfer to `zone`, and
+// reading it as though it did is exactly how someone later "fixes" this file by
+// deleting a parameter that is load-bearing.
+//
+// A project is selected by a CREDENTIAL inside one process: the slug never
+// reaches a decision at all, so a parameter for it is a parameter the handler
+// ignores. A zone is a WHOLE SEPARATE PROCESS — its own binary, its own
+// ClickHouse, its own MariaDB, its own URL — so WHICH zone answers is settled by
+// MONITOR_API_URL before the request is even sent. That makes the zone
+// checkable, and on writes it makes checking it necessary: monitor-core's
+// apikeys.resolveProject binds a new key to a project in the zone of the
+// ANSWERING PROCESS (`env.ZoneSlug`), looked up in that process's own MariaDB.
+// Point this server at the control plane, ask for an ingest key "for appleby",
+// and you get a 200 and a key bound to a TRAILBLAZE project; the service wired
+// to it then reports into the wrong tenant, permanently, with nothing on either
+// side saying so. Every other write here has the same shape — alert rules,
+// notification channels, service→repo mappings and SSO providers are all rows in
+// the answering zone's own MariaDB, and none of them names a zone in its body.
+//
+// So the `zone` parameter on the write tools is VERIFIED, NEVER ROUTED. It is
+// not forwarded to monitor-core, it never lands in a request body or query
+// string, and it cannot send a request anywhere: requireZone() compares it
+// against `zone` from GET /health — the answering process's own identity, which
+// monitor-core publishes for precisely this purpose — and REFUSES the call on a
+// mismatch. That is the whole difference from `project` in one line: `project`
+// would be an input nothing reads, `zone` is an assertion this server itself
+// checks. A required parameter that can only ever turn a silent wrong-tenant
+// write into a loud error is not the defect §5 warns about; it is its cure.
+//
+// DO NOT REMOVE IT, and do not "make it optional so it matches the reads". A
+// read carrying the wrong zone label costs a re-read; a write bound to the wrong
+// zone cannot be un-bound.
+
+// The zone, project and URL this server speaks for, resolved together and
+// reused for a short TTL (see projectScope()).
+//
+// ZONE comes from GET /health. That endpoint reports `zone` (and `role`) as THIS
+// PROCESS'S OWN IDENTITY — monitor-core stamps it from env.ZoneSlug, unauthenticated,
+// with a comment saying it exists so a caller can tell "a monitor-core answered"
+// apart from "the monitor-core I meant answered". It is therefore the only
+// authoritative answer to "which zone am I talking to", and it is right whether the
+// URL points at the control plane or at a zone.
+//
+// It replaces an earlier reading of GET /v1/zones, which counted rows and used the
+// slug only when there was exactly ONE. That was a registry LISTING, not an
+// identity: it answers "which zones does this install know about", so the moment a
+// second zone was registered the count stopped being one and `zone` silently
+// vanished from every `_scope` — at exactly the moment multi-zone made it
+// load-bearing. A fleet-wide registry can never identify the process serving it.
+//
+// PROJECT comes from GET /v1/api-keys, which is not an inference either:
+// apikeys.List filters that listing by the project QueryAuthMiddleware resolved for
+// the request, and every row carries that project's slug, so the value read back IS
+// the server's own answer to "whose data am I reading?" — the same context value
+// every event query is scoped by. Nothing echoes it more directly: an API key has no
+// /self, and monitor-core sets no project response header. Note the install's
+// `default_project_slug` (from monitor_list_projects) is NOT this: that is what an
+// unset selector resolves to for a browser session, and a key bound to a
 // non-default project answers for its own regardless.
 //
+// API_URL is echoed verbatim. It costs nothing and it closes the last ambiguity:
+// zone, project and URL together state which process answered, whose data it
+// answered with, and where to look — three facts no single response field carries.
+const SCOPE_TTL_MS = 5 * 60 * 1000;
+const SCOPE_FAILURE_TTL_MS = 30 * 1000;
+
 // Cached as a single promise INCLUDING WHEN IT FAILS. Resolving per call would
 // double the request count of every tool; retrying after a failure would do that
 // forever on an install where the label simply cannot be read. A label must
 // never cost more than the answer it labels, and must never withhold one — an
 // unresolved scope degrades to a note, never to an error.
+//
+// But it is no longer cached FOREVER, which is what it was. A memo with no
+// expiry means a long-running server reports the fleet it booted into: a process
+// started when there was one zone kept answering with that snapshot for days,
+// through a second zone being added, and could not be corrected short of a
+// restart. Five minutes on success is far longer than a burst of tool calls and
+// far shorter than a shift; thirty seconds on failure keeps the "do not hammer a
+// broken endpoint" property while letting a transient outage heal on its own.
+// Both are read at CALL time — never captured into a module-level constant,
+// which would freeze the clock at import.
 let scopePromise = null;
+let scopeExpiresAt = 0;
 
 function projectScope() {
-    if (!scopePromise) scopePromise = resolveProjectScope();
-    return scopePromise;
+    const now = Date.now();
+    if (scopePromise && now < scopeExpiresAt) return scopePromise;
+
+    // Stamp the SHORT ttl before the request is made, and extend it only once a
+    // fully-resolved answer comes back. A promise that rejects, never settles,
+    // or settles with a gap in it therefore expires quickly instead of pinning
+    // a degraded label for the full success window.
+    scopeExpiresAt = now + SCOPE_FAILURE_TTL_MS;
+    const pending = resolveProjectScope().then(
+        (scope) => {
+            // `scopePromise === pending` so a superseded in-flight resolve can
+            // never push out the expiry of the one that replaced it.
+            if (scopePromise === pending && scope && scope.project && scope.zone) {
+                scopeExpiresAt = Date.now() + SCOPE_TTL_MS;
+            }
+            return scope;
+        },
+        (err) => {
+            // resolveProjectScope's own calls cannot throw — httpRequest catches
+            // and returns an error object — so this is the belt: a label that
+            // throws still degrades to a note rather than rejecting into every
+            // tool that awaits it.
+            return {
+                project: null,
+                api_url: API_URL,
+                note: `scope could not be resolved (${err?.message ?? err}); answers are still scoped to whichever zone MONITOR_API_URL points at and whichever project MONITOR_API_KEY is bound to`,
+            };
+        }
+    );
+    scopePromise = pending;
+    return pending;
 }
 
 async function resolveProjectScope() {
-    const [keys, zones] = await Promise.all([
+    const [keys, health] = await Promise.all([
         httpRequest("GET", "/v1/api-keys"),
-        httpRequest("GET", "/v1/zones"),
+        httpRequest("GET", "/health"),
     ]);
+
+    // /health is a bare object, not a responder envelope, so `zone` is at the
+    // root. An older monitor-core that predates multi-zone omits the key
+    // entirely — treated as "unreadable", not as a zone named "undefined".
+    const zone = typeof health?.zone === "string" && health.zone !== "" ? health.zone : null;
+    const role = typeof health?.role === "string" && health.role !== "" ? health.role : null;
 
     const keyRows = Array.isArray(keys?.data) ? keys.data : [];
     const project = keyRows
         .map((k) => k?.project_slug)
-        .find((slug) => typeof slug === "string" && slug !== "");
+        .find((slug) => typeof slug === "string" && slug !== "") ?? null;
 
-    if (!project) {
-        // Honest about the gap rather than silent about it: the answers above are
-        // still scoped, the label for that scope is just unavailable.
+    // Honest about each gap rather than silent about it: the answers being
+    // labelled are still scoped, only the label for that scope is unavailable.
+    // Each half degrades on its own, so losing one does not cost the other.
+    const notes = [];
+    if (project) {
+        notes.push("events, issues and analytics answers are limited to this project. It is fixed by the api_keys row behind MONITOR_API_KEY and cannot be selected per request — reach another project with a second ~/.mcp.json entry whose key is bound to it.");
+    } else {
         const reason = keys?.success === false
             ? `HTTP ${keys.http_status ?? "error"}`
             : "no key rows returned";
-        return {
-            project: null,
-            note: `answering project could not be resolved (GET /v1/api-keys: ${reason}); results are still scoped to whichever project MONITOR_API_KEY is bound to`,
-        };
+        notes.push(`answering project could not be resolved (GET /v1/api-keys: ${reason}); results are still scoped to whichever project MONITOR_API_KEY is bound to`);
+    }
+    if (!zone) {
+        const reason = health?.success === false
+            ? `HTTP ${health.http_status ?? "error"}`
+            : "no zone reported (a monitor-core predating multi-zone)";
+        notes.push(`answering zone could not be resolved (GET /health: ${reason}); the answer still came from whichever zone MONITOR_API_URL points at, and zone-binding writes will refuse until it can be read`);
     }
 
-    const scope = {
+    // Composed as one literal so the key order states the three facts in the
+    // order a reader needs them: which zone, which project, which URL.
+    return {
+        ...(zone ? { zone } : {}),
+        ...(role ? { role } : {}),
         project,
-        note: "events, issues and analytics answers are limited to this project. It is fixed by the api_keys row behind MONITOR_API_KEY and cannot be selected per request — reach another project with a second ~/.mcp.json entry whose key is bound to it.",
+        api_url: API_URL,
+        note: notes.join(" "),
     };
+}
 
-    // The zone only when there is exactly one. A project slug is unique within
-    // its zone rather than globally, so naming the zone disambiguates the label —
-    // but the registry lists every zone the install knows about while this URL
-    // serves one, and guessing which would be worse than omitting it.
-    const zoneRows = Array.isArray(zones?.data) ? zones.data : [];
-    if (zoneRows.length === 1 && typeof zoneRows[0]?.slug === "string" && zoneRows[0].slug !== "") {
-        scope.zone = zoneRows[0].slug;
+// --- Zone verification for writes ---
+//
+// requireZone() is the guard behind every zone-binding write. It resolves this
+// server's ACTUAL zone from /health (through the same memo above, so the check
+// costs nothing per call) and compares it with the zone the caller named.
+//
+// Returns null when they agree — call sites read as `if (refusal) return refusal;`
+// — and a finished, isError tool result when they do not. A refusal rather than a
+// thrown exception because the model has to be able to read WHY: the message names
+// both zones and says what to do instead, which a stack trace does not.
+//
+// IT FAILS CLOSED when the zone cannot be read at all, and that asymmetry with
+// the `_scope` label above is deliberate. A missing label costs a re-read; an
+// unverified write is the exact failure this exists to prevent, and it is
+// permanent — a key bound to the wrong project cannot be re-bound, and the
+// service wired to it reports into another tenant until someone notices. The
+// failure TTL is 30s, so a transient /health blip blocks writes briefly rather
+// than for the process lifetime.
+async function requireZone(zone) {
+    const requested = typeof zone === "string" ? zone.trim() : "";
+    const scope = await projectScope().catch(() => null);
+    const actual = typeof scope?.zone === "string" && scope.zone !== "" ? scope.zone : null;
+
+    if (!actual) {
+        return zoneRefusal({
+            error: "zone_unverifiable",
+            error_message: `this server could not read its own zone from GET /health, so a write that would bind to a zone is refused rather than guessed. ${scope?.note ?? ""}`.trim(),
+            requested_zone: requested || null,
+            api_url: API_URL,
+            what_to_do: "Check monitor_health. A monitor-core that reports no `zone` predates multi-zone — upgrade it, or perform this write from the Monitor UI where the zone is visible.",
+        });
     }
 
-    return scope;
+    if (requested !== actual) {
+        return zoneRefusal({
+            error: "zone_mismatch",
+            error_message: `refused: this MCP server talks to zone "${actual}" (MONITOR_API_URL=${API_URL}), not "${requested || "(empty)"}". The write was NOT sent. monitor-core binds a write to the zone of the process that answers it, so sending this would have created the resource in "${actual}" under the name of a zone it has nothing to do with, returned 200, and said nothing.`,
+            requested_zone: requested || null,
+            actual_zone: actual,
+            api_url: API_URL,
+            what_to_do: `Use the ~/.mcp.json entry configured for zone "${requested || "the zone you want"}" — one with that zone's own MONITOR_API_URL and a key from it. A zone is a separate deployment; there is no request from here that can reach it.`,
+        });
+    }
+
+    return null;
 }
+
+function zoneRefusal(body) {
+    return { content: text({ success: false, ...body }), isError: true };
+}
+
+// One shared description so twelve copies cannot drift, and so the reasoning
+// travels with the parameter to whoever reads the tool list rather than the file.
+const ZONE_PARAM_DESC =
+    "REQUIRED. The zone this write must land in (e.g. \"trailblaze\"). It is VERIFIED, NOT ROUTED: this MCP server talks to exactly one zone — the one MONITOR_API_URL points at — and the call is REFUSED, unsent, if this does not match it. It exists because monitor-core binds a write to the zone of the process that answers, so a wrong-zone write would otherwise return 200 and silently create the resource in the wrong tenant. Get the value from monitor_health or from `_scope.zone` on any read; do NOT guess it from monitor_list_zones, which lists zones this install knows about, not the one it is.";
 
 // The /v1 paths that are NOT project-scoped, and so must NOT be labelled. A
 // label on one of these would assert a filter that is not there — a "wrong
@@ -373,7 +531,11 @@ const server = new McpServer({
 
 // ==================== HEALTH ====================
 
-server.tool("monitor_health", "Check Monitor API health — returns queue stats (enqueued, dropped, pending events)", {}, async () => {
+// Also this server's identity oracle: /health is where monitor-core publishes
+// `zone` and `role` for the process answering, unauthenticated and for exactly
+// this purpose ("tell 'a monitor-core answered' apart from 'the monitor-core I
+// meant answered'"). resolveProjectScope() and requireZone() both read it.
+server.tool("monitor_health", "Check Monitor API health — queue stats (enqueued, dropped, pending), store reachability (clickhouse_ok, mariadb_ok, alerting_ok), and the ANSWERING PROCESS'S OWN IDENTITY: `zone` (which zone this URL serves) and `role` (both | zone | app). That `zone` is the authoritative answer to \"which zone am I talking to\" — the one the zone-binding write tools verify against, and the one echoed as `_scope.zone` on project-scoped reads. Do not infer it from monitor_list_zones, which lists the registry rather than the process.", {}, async () => {
     const res = await api("GET", "/health");
     return { content: text(res) };
 });
@@ -387,14 +549,19 @@ server.tool("monitor_health", "Check Monitor API health — returns queue stats 
 // bootstrap.EnsureZoneAndProject and managed out of band, and slugs are immutable
 // and never reusable, so a mistyped one could only ever be retired.
 //
-// These two are the only /v1 tools whose responses carry no `_scope`
-// annotation — they answer about the install's registry, not about the project
-// this server's key reads. See the project-scope block above for why no tool
-// takes a `project` parameter.
+// Neither response carries a `_scope` annotation (SCOPE_ECHO_EXEMPT): they
+// answer about a registry, not about the project this server's key reads. Which
+// makes the trap worth stating plainly — THE REGISTRY DOES NOT IDENTIFY THE
+// PROCESS SERVING IT. Both routes read the answering process's own MariaDB, so
+// the control plane returns the whole fleet and a zone returns itself, and the
+// response is identical in shape either way. `zone` on GET /health is the
+// process's own identity and is the only thing that answers "which zone am I
+// talking to". See the project-scope block above for why no tool takes a
+// `project` parameter — and why the WRITE tools nonetheless take a `zone`.
 
 server.tool(
     "monitor_list_zones",
-    "List the zones this Monitor install knows about (GET /v1/zones). A zone is one whole monitor-core deployment — its own ClickHouse instance, URL and API keys — and every project lives inside exactly one zone. Retired zones are excluded. A single-zone install returns exactly ONE row: that is what a single-zone install looks like, not a bug. Read-only — zones are seeded out of band and their slugs are immutable, so there is no create/update/delete.",
+    "List the zones the ANSWERING process knows about (GET /v1/zones). A zone is one whole monitor-core deployment — its own ClickHouse instance, own MariaDB, own URL and own API keys — and every project lives inside exactly one zone. Retired zones are excluded.\n\nWHAT COMES BACK DEPENDS ON WHO ANSWERS, AND NOTHING IN THE RESPONSE SAYS WHICH. The handler reads the registry table in the answering process's own MariaDB: pointed at the CONTROL PLANE that is the whole fleet (every zone), pointed at a ZONE it is normally just that zone's own row. So one row does not mean 'a single-zone fleet' and several rows do not mean 'you are on the control plane' — and NONE of the rows is necessarily the zone you are talking to.\n\nTo learn which zone THIS server talks to, read `_scope.zone` on any project-scoped read, or call monitor_health — its `zone` is the answering process's own identity. That is also the value the zone-binding write tools require and verify.\n\nRead-only here: zones are seeded out of band, their slugs are immutable and never reusable, and the writes live on the control-plane-only /admin surface.",
     {
         limit: z.number().optional().describe("Max zones to return, 1-500. Omit to get them all — this route asks for 500 by default rather than the usual 50. An out-of-range value is REFUSED with a 400, never clamped."),
         offset: z.number().optional().describe("Pagination offset. Must not be negative — a negative value is refused with a 400."),
@@ -1232,13 +1399,16 @@ server.tool(
 
 server.tool(
     "monitor_set_service_repo",
-    "Map a service to its source repository. Several services may share one repository — that is the normal case for versioned services such as auth-service-v1 and auth-service-v2.",
+    "Map a service to its source repository. Several services may share one repository — that is the normal case for versioned services such as auth-service-v1 and auth-service-v2.\n\nThe mapping is a row in the answering zone's own MariaDB and serves only that zone's services, so `zone` is required and verified. Two zones can legitimately map the same service name to different repositories.",
     {
+        zone: z.string().describe(ZONE_PARAM_DESC),
         service: z.string().describe("The service name as it reports to Monitor"),
         repository: z.string().describe("'owner/repo', or any github.com URL naming the repository"),
         default_branch: z.string().optional().describe("Default branch, e.g. main"),
     },
-    async ({ service, repository, default_branch }) => {
+    async ({ zone, service, repository, default_branch }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
         const body = { repository };
         if (default_branch) body.default_branch = default_branch;
         const res = await api("PUT", `/v1/service-repos/${encodeURIComponent(service)}`, null, body);
@@ -1248,11 +1418,14 @@ server.tool(
 
 server.tool(
     "monitor_delete_service_repo",
-    "Remove a service's repository mapping.",
+    "Remove a service's repository mapping. The mapping lives in the answering zone only, so `zone` is required and verified — the same service name may be mapped in more than one zone, and deleting here does not touch the others.",
     {
+        zone: z.string().describe(ZONE_PARAM_DESC),
         service: z.string().describe("The service name"),
     },
-    async ({ service }) => {
+    async ({ zone, service }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
         const res = await api("DELETE", `/v1/service-repos/${encodeURIComponent(service)}`);
         return { content: text(res) };
     }
@@ -1270,26 +1443,47 @@ server.tool(
     }
 );
 
+// The sharpest edge in this file. monitor-core's apikeys.resolveProject binds
+// the new key to a project in the zone of the ANSWERING PROCESS (env.ZoneSlug),
+// and nothing in the request or the response names that zone — so asking the
+// control plane for an "appleby" ingest key returns 200 with a key bound to a
+// TRAILBLAZE project, and the service wired to it reports into the wrong tenant
+// until a human notices an empty dashboard. `zone` is checked here, before the
+// request, and is never sent.
 server.tool(
     "monitor_create_api_key",
-    "Create a new API key. The full key is only shown once, and this server masks it to its first two characters — the key will exist but you will not be able to read it here. Create keys in the Monitor UI when you need the value, or set MONITOR_ALLOW_SECRET_VALUES=1.",
+    "Create a new API key. The full key is only shown once, and this server masks it to its first two characters — the key will exist but you will not be able to read it here. Create keys in the Monitor UI when you need the value, or set MONITOR_ALLOW_SECRET_VALUES=1.\n\nThe key is bound to a project IN THE ZONE THIS SERVER TALKS TO, permanently and invisibly — the response does not name the zone. Hence the required `zone` argument, which is checked against this server's own zone and refuses the call on a mismatch.",
     {
+        zone: z.string().describe(ZONE_PARAM_DESC),
         name: z.string().describe("Human-readable name for the key (e.g. 'frontend-ingest', 'ci-admin')"),
         scope: z.enum(["admin", "ingest"]).describe("Key scope — 'ingest' for event ingestion only, 'admin' for full access"),
     },
-    async ({ name, scope }) => {
+    async ({ zone, name, scope }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
         const res = await api("POST", "/v1/api-keys", null, { name, scope });
         return { content: text(res) };
     }
 );
 
+// The one DESTRUCTIVE verb in the zone-binding set, and the reason it takes a
+// `zone` even though key IDs are UUIDs. "A cross-zone ID would almost certainly
+// 404" is a probability argument guarding an irreversible action: revoking an
+// ingest key stops a tenant's services reporting, and the only symptom is a 401
+// at the producer with nothing in Monitor to explain it. The consistency is also
+// the point — create_api_key requiring a zone while delete_api_key did not would
+// read as "deletes are zone-safe by construction", when they were only ever
+// zone-safe by collision odds.
 server.tool(
     "monitor_delete_api_key",
-    "Delete an API key by ID. This immediately revokes access for anything using this key.",
+    "Delete an API key by ID. This immediately revokes access for anything using this key — an ingest key's services stop reporting, and the only symptom is a 401 at the producer with nothing in Monitor explaining it. Irreversible, so `zone` is required and verified: the key you are deleting lives in THIS server's zone whatever zone the ID was copied from.",
     {
+        zone: z.string().describe(ZONE_PARAM_DESC),
         id: z.string().describe("The API key ID to delete"),
     },
-    async ({ id }) => {
+    async ({ zone, id }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
         const res = await api("DELETE", `/v1/api-keys/${id}`);
         return { content: text(res) };
     }
@@ -1321,8 +1515,9 @@ server.tool(
 
 server.tool(
     "monitor_create_alert_rule",
-    "Create a new alert rule. Types: threshold (value crosses limit), absence (no events in window), rate_change (sudden spike/drop). Conditions: gt, lt, gte, lte, eq. Priority: P0 (critical), P1 (high), P2 (medium), P3 (low). query_filters is a JSON array of {field, operator, value} objects to scope the query (e.g. [{\"field\":\"service\",\"operator\":\"eq\",\"value\":\"auth-service-v2\"}]).",
+    "Create a new alert rule. Types: threshold (value crosses limit), absence (no events in window), rate_change (sudden spike/drop). Conditions: gt, lt, gte, lte, eq. Priority: P0 (critical), P1 (high), P2 (medium), P3 (low). query_filters is a JSON array of {field, operator, value} objects to scope the query (e.g. [{\"field\":\"service\",\"operator\":\"eq\",\"value\":\"auth-service-v2\"}]).\n\nThe rule is a row in the answering zone's own MariaDB and is evaluated only against that zone's events, so `zone` is required and verified.",
     {
+        zone: z.string().describe(ZONE_PARAM_DESC),
         name: z.string().describe("Human-readable alert name"),
         description: z.string().optional().describe("Description of what this alert monitors"),
         type: z.enum(["threshold", "absence", "rate_change"]).describe("Alert type"),
@@ -1338,7 +1533,12 @@ server.tool(
         notification_channel_ids: z.string().optional().describe("JSON array of channel IDs to notify"),
         enabled: z.boolean().optional().describe("Whether the rule is active (default true)"),
     },
-    async (params) => {
+    async ({ zone, ...params }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
+        // `zone` is destructured OUT, not spread into the body. It is this
+        // server's assertion, not a field monitor-core reads — sending it would
+        // be the silently-ignored parameter the project block above warns about.
         const body = { ...params };
         if (body.enabled === undefined) body.enabled = true;
         const res = await api("POST", "/v1/alert-rules", null, body);
@@ -1348,8 +1548,9 @@ server.tool(
 
 server.tool(
     "monitor_update_alert_rule",
-    "Update an existing alert rule. This is a partial update: only fields you provide are sent, and any field you omit is left unchanged (including `enabled` — omit it to keep the rule's current on/off state; set it explicitly only when you intend to enable or disable the rule).",
+    "Update an existing alert rule. This is a partial update: only fields you provide are sent, and any field you omit is left unchanged (including `enabled` — omit it to keep the rule's current on/off state; set it explicitly only when you intend to enable or disable the rule).\n\nRule IDs are unique only within a zone, so `zone` is required and verified: an ID copied from another zone's listing would otherwise edit whatever rule happens to carry it here.",
     {
+        zone: z.string().describe(ZONE_PARAM_DESC),
         id: z.string().describe("The alert rule ID to update"),
         name: z.string().optional().describe("New name"),
         description: z.string().optional().describe("New description"),
@@ -1366,7 +1567,10 @@ server.tool(
         notification_channel_ids: z.string().optional(),
         enabled: z.boolean().optional(),
     },
-    async ({ id, ...body }) => {
+    async ({ zone, id, ...body }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
+        // `zone` is destructured out with `id`: neither belongs in the body.
         // Only send fields the caller actually provided. In particular, never
         // send enabled:false just because it was omitted — that would disable
         // the rule (belt-and-suspenders alongside the backend preserving it).
@@ -1381,11 +1585,14 @@ server.tool(
 
 server.tool(
     "monitor_delete_alert_rule",
-    "Delete an alert rule by ID.",
+    "Delete an alert rule by ID. Rule IDs are unique only within a zone, so `zone` is required and verified — an ID copied from another zone's listing would otherwise delete whatever rule carries it here.",
     {
+        zone: z.string().describe(ZONE_PARAM_DESC),
         id: z.string().describe("The alert rule ID to delete"),
     },
-    async ({ id }) => {
+    async ({ zone, id }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
         const res = await api("DELETE", `/v1/alert-rules/${id}`);
         return { content: text(res) };
     }
@@ -1423,13 +1630,16 @@ server.tool(
 
 server.tool(
     "monitor_create_notification_channel",
-    "Create a notification channel that alert rules can notify. Returns the created channel including its generated id. The `config` field is a JSON *string* whose shape depends on `type` (e.g. webhook: {\"url\":\"https://...\"}, slack: {\"webhook_url\":\"https://hooks.slack.com/...\"}, email: {\"to\":\"a@b.com\"}, pagerduty: {\"routing_key\":\"...\"}).",
+    "Create a notification channel that alert rules can notify. Returns the created channel including its generated id. The `config` field is a JSON *string* whose shape depends on `type` (e.g. webhook: {\"url\":\"https://...\"}, slack: {\"webhook_url\":\"https://hooks.slack.com/...\"}, email: {\"to\":\"a@b.com\"}, pagerduty: {\"routing_key\":\"...\"}).\n\nThe channel is a row in the answering zone's own MariaDB and can only be wired into that zone's alert rules, so `zone` is required and verified.",
     {
+        zone: z.string().describe(ZONE_PARAM_DESC),
         name: z.string().describe("Human-readable channel name"),
         type: z.enum(["webhook", "slack", "email", "pagerduty"]).describe("Channel type"),
         config: z.string().optional().describe("Channel configuration as a JSON string (type-dependent). Defaults to empty."),
     },
-    async ({ name, type, config }) => {
+    async ({ zone, name, type, config }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
         const body = { name, type };
         if (config !== undefined) body.config = config;
         const res = await api("POST", "/v1/notification-channels", null, body);
@@ -1439,11 +1649,14 @@ server.tool(
 
 server.tool(
     "monitor_delete_notification_channel",
-    "Delete a notification channel by ID. Alert rules referencing it will no longer notify through this channel.",
+    "Delete a notification channel by ID. Alert rules referencing it will no longer notify through this channel. Channel IDs are unique only within a zone, so `zone` is required and verified — an ID copied from another zone's listing would otherwise silence alerts here.",
     {
+        zone: z.string().describe(ZONE_PARAM_DESC),
         id: z.string().describe("The notification channel ID to delete"),
     },
-    async ({ id }) => {
+    async ({ zone, id }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
         const res = await api("DELETE", `/v1/notification-channels/${id}`);
         return { content: text(res) };
     }
@@ -1473,8 +1686,9 @@ server.tool(
 
 server.tool(
     "monitor_create_sso_provider",
-    "Create an SSO provider (POST /admin/sso-providers). slug and display_name are required; everything else is optional. kind is oidc (default) or oauth2 — OIDC providers set issuer_url (endpoints are discovered), OAuth2 providers set authorize_url/token_url/userinfo_url (and optionally introspect_url) explicitly. client_secret is PLAINTEXT and write-only: it is AES-256-GCM encrypted at rest and never echoed back (the response exposes only has_secret). Provide EITHER client_secret (encrypted at rest) OR client_secret_ref (a Keyring secret name), not both. scopes is a single space-separated string. ADMIN SESSION REQUIRED (SessionMiddleware + RequireAdmin, Bearer JWT only — X-Api-Key is rejected; set MONITOR_SESSION_TOKEN).",
+    "Create an SSO provider (POST /admin/sso-providers). slug and display_name are required; everything else is optional. kind is oidc (default) or oauth2 — OIDC providers set issuer_url (endpoints are discovered), OAuth2 providers set authorize_url/token_url/userinfo_url (and optionally introspect_url) explicitly. client_secret is PLAINTEXT and write-only: it is AES-256-GCM encrypted at rest and never echoed back (the response exposes only has_secret). Provide EITHER client_secret (encrypted at rest) OR client_secret_ref (a Keyring secret name), not both. scopes is a single space-separated string. ADMIN SESSION REQUIRED (SessionMiddleware + RequireAdmin, Bearer JWT only — X-Api-Key is rejected; set MONITOR_SESSION_TOKEN).\n\nProviders are rows in the answering zone's own MariaDB and govern who can sign in to THAT zone, so `zone` is required and verified — a provider created in the wrong zone appears on the wrong login page.",
     {
+        zone: z.string().describe(ZONE_PARAM_DESC),
         slug: z.string().describe("URL-safe unique identifier (required), e.g. \"google\" or \"okta\""),
         display_name: z.string().describe("Human-readable provider name (required)"),
         kind: z.enum(["oidc", "oauth2"]).optional().describe("Provider protocol: oidc (default) or oauth2"),
@@ -1497,7 +1711,11 @@ server.tool(
         button_label: z.string().optional().describe("Override text for the login button (defaults to display_name)"),
         enabled: z.boolean().optional().describe("Whether the provider is active and shown on the login page"),
     },
-    async (body) => {
+    async ({ zone, ...body }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
+        // `zone` is destructured out before the payload is built: it is checked,
+        // never forwarded, and monitor-core has no field for it here.
         const payload = {};
         for (const [k, v] of Object.entries(body)) {
             if (v !== undefined) payload[k] = v;
@@ -1509,8 +1727,9 @@ server.tool(
 
 server.tool(
     "monitor_update_sso_provider",
-    "Update an SSO provider by slug (PUT /admin/sso-providers/{slug}). PARTIAL update: only the fields you provide are sent and changed; omitted fields are left unchanged. The slug itself is the path key and cannot be changed here. client_secret is plaintext/write-only (re-encrypted at rest, never returned); provide client_secret OR client_secret_ref. ADMIN SESSION REQUIRED (SessionMiddleware + RequireAdmin, Bearer JWT only — X-Api-Key is rejected; set MONITOR_SESSION_TOKEN).",
+    "Update an SSO provider by slug (PUT /admin/sso-providers/{slug}). PARTIAL update: only the fields you provide are sent and changed; omitted fields are left unchanged. The slug itself is the path key and cannot be changed here. client_secret is plaintext/write-only (re-encrypted at rest, never returned); provide client_secret OR client_secret_ref. ADMIN SESSION REQUIRED (SessionMiddleware + RequireAdmin, Bearer JWT only — X-Api-Key is rejected; set MONITOR_SESSION_TOKEN).\n\nA provider slug is unique only within a zone, so `zone` is required and verified — the same slug (\"google\") normally exists in every zone with different credentials.",
     {
+        zone: z.string().describe(ZONE_PARAM_DESC),
         slug: z.string().describe("Slug of the provider to update (path parameter, immutable)"),
         display_name: z.string().optional().describe("New display name"),
         kind: z.enum(["oidc", "oauth2"]).optional().describe("Provider protocol: oidc or oauth2"),
@@ -1533,7 +1752,11 @@ server.tool(
         button_label: z.string().optional().describe("Login button label"),
         enabled: z.boolean().optional().describe("Whether the provider is active"),
     },
-    async ({ slug, ...body }) => {
+    async ({ zone, slug, ...body }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
+        // `zone` and `slug` are both destructured out: slug is the path key and
+        // zone is this server's assertion. Neither belongs in the body.
         const payload = {};
         for (const [k, v] of Object.entries(body)) {
             if (v !== undefined) payload[k] = v;
@@ -1545,11 +1768,14 @@ server.tool(
 
 server.tool(
     "monitor_delete_sso_provider",
-    "Delete an SSO provider by slug (DELETE /admin/sso-providers/{slug}). ADMIN SESSION REQUIRED (SessionMiddleware + RequireAdmin, Bearer JWT only — X-Api-Key is rejected; set MONITOR_SESSION_TOKEN).",
+    "Delete an SSO provider by slug (DELETE /admin/sso-providers/{slug}). ADMIN SESSION REQUIRED (SessionMiddleware + RequireAdmin, Bearer JWT only — X-Api-Key is rejected; set MONITOR_SESSION_TOKEN).\n\nA provider slug is unique only within a zone, so `zone` is required and verified — deleting \"google\" here removes a sign-in route for THIS zone's users only, and doing it in the wrong zone locks out the wrong people.",
     {
+        zone: z.string().describe(ZONE_PARAM_DESC),
         slug: z.string().describe("Slug of the provider to delete"),
     },
-    async ({ slug }) => {
+    async ({ zone, slug }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
         const res = await api("DELETE", `/admin/sso-providers/${slug}`);
         return { content: text(res) };
     }
