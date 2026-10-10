@@ -411,7 +411,10 @@ Facts the prompts rely on, verified against `monitor-core` `routes/issues.go`
   this filter to `first_seen`, `check` silently reports the wrong set; update both.
 - **`status` is single-valued**, so open work (`unresolved` + `in_progress`) is two calls.
 - **The list response is `responder.NewWithCount`** — `pagination.count` is the filtered
-  total, which is what makes a `limit: 1` call a valid open-count.
+  total, which is what makes a `limit: 1` call a valid open-count. **A zero total is
+  omitted** (`Pagination.Count` is `json:"count,omitempty"` in `responder/responder.go`), so an
+  empty result is `{"pagination": {}, "data": null}` — both the instructions and `check` say
+  to read that as 0. Found in the 1.5.0 live test: `in_progress` came back exactly that way.
 - `sort` ∈ `last_seen` | `first_seen` | `occurrences`; an unknown value is a 400.
 
 Rules for this block:
@@ -572,7 +575,7 @@ Prompts and instructions need no `monitor-core`: drive `index.js` over stdio wit
 `MONITOR_API_URL`/`MONITOR_API_KEY`, then check that `initialize` returns `instructions`
 and a `prompts` capability, that `prompts/list` shows `check` and `triage`, and that
 `prompts/get` renders `check` with and without `service`/`window`, rejects `window:
-"yesterday"`, and rejects `triage` without `issue`. Last done 2026-10-10 (1.5.0): all of the
+"yesterday"`, and rejects `triage` without `issue`. Last done 2026-10-10 (1.5.1): all of the
 above as stated, 56 tools still listed.
 
 …plus a **manual end-to-end smoke test** against a running `monitor-core` with a valid

@@ -534,7 +534,7 @@ const SERVER_INSTRUCTIONS = `Monitor is event ingestion and error tracking. How 
 
 - Errors: start with monitor_list_issues (errors grouped by fingerprint, with occurrence counts), then monitor_get_issue and monitor_get_issue_events. monitor_recent_errors returns raw, ungrouped events — use it only for "what happened in the last few minutes".
 - Open work is TWO statuses: unresolved and in_progress. Filtering status=unresolved alone hides issues someone is already working on.
-- monitor_list_issues from/to filter on last_seen ("still firing"), not first_seen. "New" means first_seen inside the window. Report both, and lead with the total open count (pagination.count) — "nothing new" is not "all clear".
+- monitor_list_issues from/to filter on last_seen ("still firing"), not first_seen. "New" means first_seen inside the window. Report both, and lead with the total open count (pagination.count; absent when it is 0, with data: null) — "nothing new" is not "all clear".
 - Raw events expire after 30 days. For older activity or "how often does this recur", use monitor_get_issue_history.
 - Investigation is read-only. Do not change issue status (monitor_update_issue / monitor_bulk_update_issues) until a fix is confirmed and the user agrees. A resolved issue that recurs reopens as a regression; in_progress does not.
 - Before writing a note, read monitor_get_issue_timeline; write with monitor_add_issue_comment and a dedupe_key.
@@ -1890,7 +1890,7 @@ ${service ? `First confirm \`${service}\` appears in monitor_list_services. If i
 
 Open work is two statuses, so make these calls in parallel:
 
-1. Totals — monitor_list_issues { status: "unresolved"${svcArg}, limit: 1 } and the same with status "in_progress". Each response's pagination.count is that status's full open total.
+1. Totals — monitor_list_issues { status: "unresolved"${svcArg}, limit: 1 } and the same with status "in_progress". Each response's pagination.count is that status's full open total. A zero total comes back as pagination: {} with data: null — the count key is omitted, not missing data; read it as 0.
 2. Firing — monitor_list_issues { status: "unresolved"${svcArg}, from: "${from}", sort: "last_seen", limit: 500 } and the same with status "in_progress". \`from\` filters on last_seen, so these are exactly the open issues that fired inside the window. If pagination.count exceeds the rows returned, page with offset rather than reporting a partial list as complete.
 
 From the firing set, derive client-side (no further calls):
