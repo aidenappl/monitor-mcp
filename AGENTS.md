@@ -14,15 +14,17 @@ and consumed via `npx -y monitor-mcp`, configured in `~/.mcp.json`. It is one of
 five platform MCP servers (`lattice-mcp`, `monitor-mcp`, `forta-mcp`, `keyring-mcp`,
 `openbucket-mcp`), all following the same shape.
 
-It **owns**: the tool definitions, their JSON schemas, and the HTTP mapping to
-`monitor-core`. It **does not** own any data or logic — every tool is a thin call to a
+It **owns**: the tool definitions, their JSON schemas, the HTTP mapping to
+`monitor-core`, and the **shared usage guidance** — the server `instructions` and the
+`check` / `triage` prompts (§6c), which replaced per-machine `~/.claude/skills` copies. It
+**does not** own any data or logic — every tool is a thin call to a
 `monitor-core` `/v1/*` route.
 
 ---
 
 ## 2. Stack & dependencies
 
-- Node ESM, single file `index.js` (~1785 lines).
+- Node ESM, single file `index.js` (~1965 lines).
 - `@modelcontextprotocol/sdk` (MCP server) + `zod` (tool input schemas).
 - Talks to `monitor-core` over `fetch` (native).
 
@@ -32,7 +34,7 @@ It **owns**: the tool definitions, their JSON schemas, and the HTTP mapping to
 
 ```
 monitor-mcp/
-  index.js        # Everything: config/setup, api() helper, tool registrations, server bootstrap
+  index.js        # Everything: config/setup, api() helper, server instructions, tool + prompt registrations, bootstrap
   package.json    # bin: monitor-mcp; version (see §9)
   README.md
   .gitignore
@@ -379,6 +381,54 @@ cannot drift.
 
 ---
 
+## 6c. Server instructions & prompts — the shared usage guidance
+
+How to *use* Monitor well used to live in local `~/.claude/skills` files (`/checkmonitor`,
+the Monitor agents of `/diagnose` and `/healthcheck`) and in `CLAUDE.md`. Those copies
+drifted: two releases after `monitor_list_issues` gained `from`/`to`/`sort` and the
+`in_progress` status, a skill was still telling the model the API had no time filter and
+filtering `status: "unresolved"`, which hid every in-progress issue. The guidance now ships
+here so it is versioned with the tools it describes.
+
+**`SERVER_INSTRUCTIONS`** — passed as `instructions` to `new McpServer(…, { instructions })`
+and returned in the `initialize` result; Claude Code puts it in context whenever the server
+is connected. Cross-cutting rules only. **Keep it short** (~1.5k chars today) — it costs
+context in every session — and keep every claim checkable against a handler.
+
+**Prompts** (`server.registerPrompt`, surfaced as `/mcp__monitor__<name>`):
+
+| Prompt | Args | Drives |
+|---|---|---|
+| `check` | `service?`, `window?` (default `24h`) | `monitor_list_issues` × status (`unresolved`, `in_progress`) × {totals `limit: 1`, firing `from` + `sort: last_seen`}; derives new (`first_seen`) and regressed (`regressed_at`) client-side |
+| `triage` | `issue` (id or search text) | `get_issue`, `get_issue_timeline`, `get_issue_events`, `get_issue_history`, `error_trend`, then `trace`/`request` |
+
+Facts the prompts rely on, verified against `monitor-core` `routes/issues.go`
+(`parseIssueFilters`) and `query/issues.query.go` (`applyIssueFilters`, `IssueSort.column`):
+
+- **`from`/`to` filter on `issues.last_seen`**, never `first_seen`. So a `from` query is
+  "fired in window", and every issue *new* in the window is inside it (first_seen ≤
+  last_seen) — `check` derives "new" without a second query. If monitor-core ever moves
+  this filter to `first_seen`, `check` silently reports the wrong set; update both.
+- **`status` is single-valued**, so open work (`unresolved` + `in_progress`) is two calls.
+- **The list response is `responder.NewWithCount`** — `pagination.count` is the filtered
+  total, which is what makes a `limit: 1` call a valid open-count.
+- `sort` ∈ `last_seen` | `first_seen` | `occurrences`; an unknown value is a 400.
+
+Rules for this block:
+
+- **Prompts never call the API.** They return instructions; the model calls the tools. The
+  only computation is `windowStart()`, which turns `24h` into an exact RFC3339 `from` at
+  call time (so the model does no date arithmetic) and **throws** on anything else — a
+  silently defaulted window would report the wrong period as if it were the asked one.
+- **Prompt args are strings** (MCP's definition), so no numbers or enums in `argsSchema`.
+- **No machine-specific knowledge.** Mapping a project name (`trailblaze`) to Monitor
+  services stays in each user's local context files; the prompts take service names and
+  tell the model to ask when a name is not a service.
+- **A tool change that alters something the instructions or a prompt states updates them in
+  the same change** — that co-location is the whole reason they moved here.
+
+---
+
 ## 7. Coverage gaps (routes with no tool)
 
 Per the house rule, these `monitor-core` routes have **no MCP tool** — decide add-or-skip:
@@ -451,6 +501,8 @@ Verify with the two cases together: a created key must come back `mo**********`,
 - Read the `monitor-core` handler before adding/changing a tool (§5).
 - Keep `query_filters`/`notification_channel_ids` as JSON strings.
 - `server.version` is read from `package.json` at startup — bump only `package.json`.
+- **Keep `SERVER_INSTRUCTIONS` and the prompts true to the tools** (§6c). Changing a tool's
+  filters, statuses or defaults means re-reading both in the same change.
 - Any new `monitor-core` route → add or consciously skip a tool here.
 - **Never add a `project` parameter to a tool** (§6a). `monitor-core`'s
   `middleware/query_auth.go` derives the project from the `api_keys` row behind
@@ -513,7 +565,15 @@ There is no build step and no automated test suite, so verification is three thi
 ```bash
 node --check index.js                 # must pass
 grep -c 'server.tool(' index.js       # must match the count in §6 (56)
+grep -c 'server.registerPrompt(' index.js   # must match §6c (2)
 ```
+
+Prompts and instructions need no `monitor-core`: drive `index.js` over stdio with dummy
+`MONITOR_API_URL`/`MONITOR_API_KEY`, then check that `initialize` returns `instructions`
+and a `prompts` capability, that `prompts/list` shows `check` and `triage`, and that
+`prompts/get` renders `check` with and without `service`/`window`, rejects `window:
+"yesterday"`, and rejects `triage` without `issue`. Last done 2026-10-10 (1.5.0): all of the
+above as stated, 56 tools still listed.
 
 …plus a **manual end-to-end smoke test** against a running `monitor-core` with a valid
 **admin-scope** key: drive `index.js` over stdio (`initialize`, `notifications/initialized`,

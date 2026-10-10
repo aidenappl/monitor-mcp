@@ -524,10 +524,31 @@ function sanitise(node, depth = 0) {
 
 // --- Server ---
 
-const server = new McpServer({
-    name: "monitor",
-    version: pkg.version,
-});
+// Sent to the client at initialize; Claude Code places it in the model's context
+// whenever this server is connected. This is the shared, versioned home for HOW to
+// use Monitor — rules that used to live in per-machine skills and CLAUDE.md files
+// and drifted from the tools (one skill still claimed list_issues had no time
+// filter or sort two releases after both shipped). Keep it short — it costs
+// context on every session — and keep every claim checkable against a handler.
+const SERVER_INSTRUCTIONS = `Monitor is event ingestion and error tracking. How to use these tools well:
+
+- Errors: start with monitor_list_issues (errors grouped by fingerprint, with occurrence counts), then monitor_get_issue and monitor_get_issue_events. monitor_recent_errors returns raw, ungrouped events — use it only for "what happened in the last few minutes".
+- Open work is TWO statuses: unresolved and in_progress. Filtering status=unresolved alone hides issues someone is already working on.
+- monitor_list_issues from/to filter on last_seen ("still firing"), not first_seen. "New" means first_seen inside the window. Report both, and lead with the total open count (pagination.count) — "nothing new" is not "all clear".
+- Raw events expire after 30 days. For older activity or "how often does this recur", use monitor_get_issue_history.
+- Investigation is read-only. Do not change issue status (monitor_update_issue / monitor_bulk_update_issues) until a fix is confirmed and the user agrees. A resolved issue that recurs reopens as a regression; in_progress does not.
+- Before writing a note, read monitor_get_issue_timeline; write with monitor_add_issue_comment and a dedupe_key.
+- Scope: every project-scoped answer carries _scope (zone, project, api_url). This server reads exactly one project — the API key's. A service missing from monitor_list_services is not reporting here; absence is not health.
+
+Prompts: "check" (open issues — firing, new, regressed) and "triage" (one issue in depth).`;
+
+const server = new McpServer(
+    {
+        name: "monitor",
+        version: pkg.version,
+    },
+    { instructions: SERVER_INSTRUCTIONS }
+);
 
 // ==================== HEALTH ====================
 
@@ -1818,6 +1839,125 @@ server.tool(
     async () => {
         const res = await api("GET", "/auth/self");
         return { content: text(res) };
+    }
+);
+
+// ==================== PROMPTS ====================
+
+// Reusable workflows, surfaced by Claude Code as /mcp__monitor__<name>. They ship
+// with the tools they drive, so a tool change and the workflow that depends on it
+// land in the same release. They resolve to instructions for the model — no API
+// call happens here — so prompt arguments are plain strings by MCP's definition.
+//
+// Mapping a PROJECT name ("trailblaze") to its Monitor services is deliberately
+// not done here: that mapping lives in each user's own context files, and this
+// package must not know any one machine's layout.
+
+const WINDOW_UNITS_MS = { m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 };
+
+// "24h" → RFC3339 timestamp that long ago. Computed here, at call time, so the
+// model is handed an exact `from` rather than doing date arithmetic itself.
+function windowStart(window) {
+    const m = /^(\d+)\s*([mhdw])$/i.exec(window.trim());
+    if (!m || Number(m[1]) <= 0) {
+        throw new Error(`invalid window "${window}" — use a number and a unit, e.g. 30m, 6h, 24h, 7d, 2w`);
+    }
+    return new Date(Date.now() - Number(m[1]) * WINDOW_UNITS_MS[m[2].toLowerCase()]).toISOString();
+}
+
+function userPrompt(body) {
+    return { messages: [{ role: "user", content: { type: "text", text: body } }] };
+}
+
+server.registerPrompt(
+    "check",
+    {
+        title: "Check open issues",
+        description: "Open issues in Monitor — what is actively firing, what is new, and what has regressed — leading with the full open count so 'nothing new' is never mistaken for 'all clear'. Read-only.",
+        argsSchema: {
+            service: z.string().optional().describe("Monitor service name. Omit for every service."),
+            window: z.string().optional().describe("How far back counts as recent: 30m, 6h, 24h, 7d … (default 24h)"),
+        },
+    },
+    ({ service, window }) => {
+        const span = window?.trim() || "24h";
+        const from = windowStart(span);
+        const scope = service ? ` in service \`${service}\`` : "";
+        const svcArg = service ? `, service: "${service}"` : "";
+        return userPrompt(`Check open issues in Monitor${scope} over the last ${span} (from = ${from}). This is read-only: do not call monitor_update_issue, monitor_bulk_update_issues or any other write tool.
+
+${service ? `First confirm \`${service}\` appears in monitor_list_services. If it does not, it may be a project name rather than a service — map it to service names from the user's own context if available, otherwise list the services and ask. Run the steps below once per service (in parallel) and merge.\n\n` : ""}## Fetch
+
+Open work is two statuses, so make these calls in parallel:
+
+1. Totals — monitor_list_issues { status: "unresolved"${svcArg}, limit: 1 } and the same with status "in_progress". Each response's pagination.count is that status's full open total.
+2. Firing — monitor_list_issues { status: "unresolved"${svcArg}, from: "${from}", sort: "last_seen", limit: 500 } and the same with status "in_progress". \`from\` filters on last_seen, so these are exactly the open issues that fired inside the window. If pagination.count exceeds the rows returned, page with offset rather than reporting a partial list as complete.
+
+From the firing set, derive client-side (no further calls):
+- **New** — first_seen >= ${from}. A new issue has necessarily fired in the window, so the firing set already contains every one.
+- **Regressed** — regressed_at >= ${from}: was resolved, came back.
+
+## Report
+
+Open with one line covering the WHOLE open set, so the answer can never read as "nothing is wrong":
+
+\`{TOTAL} open issues (U unresolved, P in progress){ in service}; F fired in the last ${span}; N new; R regressed.\`
+
+Then name the zone and project that answered, from _scope.
+
+**Actively firing** — sorted by last_seen descending; this matches the Monitor web UI, which sorts by last seen. Mark rows **NEW**, **REGRESSED** or **IN PROGRESS** where they apply.
+
+| Service | Last seen | First seen | Count | Status | Title |
+|---------|-----------|------------|-------|--------|-------|
+
+Title is \`title\` when set, else \`message\`, else \`name\`.
+
+**New this window** — one line per new issue, sorted by first_seen descending, pointing back to its firing row rather than repeating it.
+
+If a section is empty, say so and keep the other — e.g. "No new issues in the last ${span}, but 3 existing issues are still firing."
+
+**Notable:** one line each for any of: occurrence_count > 100; regression_count > 0; first_seen more than 7 days ago and still firing (a long-running unnoticed failure is what this check exists to surface); two rows sharing a fingerprint (a grouping bug — collapse them and say so rather than counting them twice).
+
+To dig into one issue, suggest the "triage" prompt with its id.`);
+    }
+);
+
+server.registerPrompt(
+    "triage",
+    {
+        title: "Triage one issue",
+        description: "Investigate a single Monitor issue in depth — when it started, how often it recurs, what the failing requests carry, what has already been recorded, and which code it points at. Read-only unless you approve a note.",
+        argsSchema: {
+            issue: z.string().describe("Issue id, or search text to find it (matched against name, message, title and path)"),
+        },
+    },
+    ({ issue }) => {
+        return userPrompt(`Triage the Monitor issue "${issue}". This is an investigation: do not change status, priority or assignee, and do not comment unless the user approves it at the end.
+
+## 1. Find it
+
+Try monitor_get_issue { id: "${issue}" }. If that is not found, monitor_list_issues { q: "${issue}", limit: 20 } across all statuses; if several match, list them (service, status, count, last seen, title) and ask which one rather than guessing.
+
+## 2. Gather — in parallel once you have the id
+
+- monitor_get_issue — status, counts, first/last seen, regressed_at, linked PRs, assignee, repository.
+- monitor_get_issue_timeline — what humans and agents have ALREADY found. Read it before concluding anything, and do not repeat it back as new.
+- monitor_get_issue_events { limit: 10 } — the actual failing occurrences with full payloads. Raw events expire after 30 days; if this is empty, say so and rely on history.
+- monitor_get_issue_history { from: 90 days ago } — when it started and how it recurs; this rollup survives event expiry.
+- monitor_error_trend { service, interval: "hour" } over the issue's recent activity — is it a spike or a steady drip?
+
+Then, if an event carries trace_id or request_id, follow one with monitor_trace / monitor_request to see the whole request around the failure.
+
+## 3. Report
+
+- **What** — the error in one sentence, and the endpoint/operation it hits.
+- **Since** — first seen, the shape of the history (constant, bursty, started on a specific day), regressions.
+- **Evidence** — the 2–3 payload fields that matter, quoted from events. Never invent a field.
+- **Already known** — a summary of the timeline and any linked PRs.
+- **Where in the code** — if the issue has a repository, the path or handler the events point at, so the user can open it.
+- **Likely cause** — your best assessment with your confidence, or the top 2–3 hypotheses ranked.
+
+Then offer, and do only if the user says yes: record the findings with monitor_add_issue_comment using dedupe_key "triage:<issue id>" so a re-run edits the note instead of duplicating it. Status changes wait until a fix is confirmed.`);
     }
 );
 

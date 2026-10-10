@@ -127,6 +127,25 @@ Several services routinely share one repository — `auth-service-v1` and `auth-
 are versions of one service — so the mapping is explicit rather than derived from the
 service name. Mapping a service is what lets `monitor_link_issue_pr` accept a bare `#42`.
 
+## Workflows & guidance
+
+The server ships its usage rules and two workflows, so every machine running `npx -y monitor-mcp`
+gets the same behaviour without local skill files.
+
+**Server instructions** are sent at connect and placed in the model's context: start error work
+with `monitor_list_issues`, open work is `unresolved` **and** `in_progress`, `from`/`to` filter on
+`last_seen`, investigation is read-only, and so on.
+
+**Prompts** — in Claude Code they appear as slash commands:
+
+| Command | What it does |
+|---------|--------------|
+| `/mcp__monitor__check [service] [window]` | Open issues — total open, actively firing, new and regressed in the window (default `24h`; `30m`, `6h`, `7d`, `2w` …). Read-only. |
+| `/mcp__monitor__triage <issue>` | One issue in depth, by id or search text — start and recurrence, failing payloads, existing timeline notes, likely cause. Offers to record a note; never changes status. |
+
+Mapping a project name to its Monitor services is left to the user's own context; the prompts take
+service names.
+
 ## Example Prompts
 
 - "What errors happened in the last hour?"
