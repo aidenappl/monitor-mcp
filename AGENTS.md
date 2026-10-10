@@ -104,7 +104,7 @@ tool here in the same change. See §7 for the current gaps.
 
 ---
 
-## 6. Tool inventory (55 tools)
+## 6. Tool inventory (56 tools)
 
 Tenancy/registry (added 2026-09-07, verified against
 `monitor-core/routes/HandleListZones.router.go` and `HandleListProjects.router.go`):
@@ -135,7 +135,7 @@ levels|users`, `monitor_get_data_keys|data_values`, `monitor_search_events`,
 
 Issues — the error-tracking surface (expanded 2026-08-25, verified against
 `monitor-core/routes/issues.go`, `issue_timeline.go` and `service_repos.go`):
-`monitor_list_issues`, `monitor_get_issue`, `monitor_update_issue`,
+`monitor_list_issues`, `monitor_get_issue`, `monitor_update_issue`, `monitor_bulk_update_issues`,
 `monitor_get_issue_events`, `monitor_get_issue_timeline`, `monitor_get_issue_history`,
 `monitor_add_issue_comment`, `monitor_edit_issue_comment`, `monitor_delete_issue_comment`,
 `monitor_list_issue_links`, `monitor_link_issue_pr`, `monitor_unlink_issue_pr`.
@@ -143,7 +143,7 @@ Issues — the error-tracking surface (expanded 2026-08-25, verified against
 Service repositories: `monitor_list_service_repos`, `monitor_set_service_repo`,
 `monitor_delete_service_repo`.
 
-**Four things to get right in this block, all verified against the handlers:**
+**Five things to get right in this block, all verified against the handlers:**
 
 - **`status` ∈ unresolved | in_progress | resolved | ignored.** `in_progress` was added
   2026-08-25; a tool schema still listing three values rejects it client-side while the API
@@ -151,6 +151,13 @@ Service repositories: `monitor_list_service_repos`, `monitor_set_service_repo`,
   also the backlog — there is no separate `backlog` value.
 - **`status` is OPTIONAL on `monitor_update_issue`.** It used to be required, back when it
   was the only mutable field. Priority, title and assignee are now settable too.
+- **`monitor_bulk_update_issues` → `POST /v1/issues/bulk`** (added 2026-10-10, verified
+  against `monitor-core/routes/issues_bulk.go`). Status only. Exactly one of `ids` (≤ 1000,
+  else 400) or `filter`; the filter keys are the list endpoint's (`status`, `service`, `q`,
+  `assignee`, `has_pr`, `from`, `to`) and the API **refuses** `sort`/`order`/`limit`/`offset`
+  and a filter that narrows nothing — so the schema exposes only the accepted keys. One pass
+  moves at most 1000; `remaining` in the response says whether to call again. `dry_run`
+  returns `matched` and writes nothing.
 - **Clearing a field needs an explicit JSON `null`.** The API distinguishes
   `{"priority": null}` (unset it) from an omitted key (leave it), which one optional
   parameter cannot express — hence the `clear_priority` / `clear_title` / `clear_assignee`
@@ -505,7 +512,7 @@ There is no build step and no automated test suite, so verification is three thi
 
 ```bash
 node --check index.js                 # must pass
-grep -c 'server.tool(' index.js       # must match the count in §6 (55)
+grep -c 'server.tool(' index.js       # must match the count in §6 (56)
 ```
 
 …plus a **manual end-to-end smoke test** against a running `monitor-core` with a valid

@@ -1243,6 +1243,36 @@ server.tool(
 );
 
 server.tool(
+    "monitor_bulk_update_issues",
+    "Move many issues to one status in a single call — by explicit ids, or by a filter using the same fields as monitor_list_issues. Issues already at the target status are skipped. Each pass changes at most 1000; the response's `remaining` is how many a repeat of the same call would still move, so drain a large filter by calling again until it is 0. Run with dry_run first to see `matched` without changing anything. Every changed issue gets a status timeline entry attributed to this API key.",
+    {
+        status: z.enum(["unresolved", "in_progress", "resolved", "ignored"]).describe("Target status for every selected issue"),
+        ids: z.array(z.string()).optional().describe("Issue ids (max 1000). Supply this OR filter, not both."),
+        filter: z.object({
+            status: z.enum(["unresolved", "in_progress", "resolved", "ignored"]).optional().describe("Only issues currently at this status"),
+            service: z.string().optional().describe("Service name"),
+            q: z.string().optional().describe("Substring search across name, message, title and path"),
+            assignee: z.string().optional().describe("Assignee user id, or 'none' for unassigned"),
+            has_pr: z.boolean().optional().describe("Only issues that do (or do not) have a linked pull request"),
+            from: z.string().optional().describe("Only issues last seen at or after this time (RFC3339 or unix seconds)"),
+            to: z.string().optional().describe("Only issues last seen at or before this time (RFC3339 or unix seconds)"),
+        }).optional().describe("Select by the list filters. Must narrow by at least one field. Supply this OR ids, not both."),
+        dry_run: z.boolean().optional().describe("Count what would change without changing it"),
+    },
+    async ({ status, ids, filter, dry_run }) => {
+        if ((ids === undefined) === (filter === undefined)) {
+            return { content: text({ error: "supply exactly one of ids or filter" }) };
+        }
+        const body = { status };
+        if (ids !== undefined) body.ids = ids;
+        if (filter !== undefined) body.filter = filter;
+        if (dry_run) body.dry_run = true;
+        const res = await api("POST", "/v1/issues/bulk", null, body);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
     "monitor_get_issue_events",
     "Get individual event occurrences behind a grouped issue, with their full data payloads. Note that raw events expire after 30 days — use monitor_get_issue_history for older activity, which survives that expiry.",
     {

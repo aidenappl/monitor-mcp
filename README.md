@@ -98,6 +98,7 @@ thread, linked pull requests and durable occurrence history.
 | `monitor_list_issues` | List issues, filtered by status, service, assignee, `has_pr`, search or time window |
 | `monitor_get_issue` | Full detail — links, assignee, repository, comment count, 30-day sparkline |
 | `monitor_update_issue` | Set status, priority, title or assignee. Every change is recorded on the timeline against you |
+| `monitor_bulk_update_issues` | Set one status on many issues — by ids or by list filter, with `dry_run`; 1000 per pass, `remaining` says when to repeat |
 | `monitor_get_issue_events` | Individual occurrences with their data payloads (raw events expire after 30 days) |
 | `monitor_get_issue_timeline` | The activity feed — comments, status changes, regressions, PR events |
 | `monitor_get_issue_history` | Per-day occurrence counts. Survives the 30-day event expiry |
