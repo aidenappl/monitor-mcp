@@ -1737,7 +1737,7 @@ server.tool(
 
 server.tool(
     "monitor_create_sso_provider",
-    "Create an SSO provider (POST /admin/sso-providers). slug and display_name are required; everything else is optional. kind is oidc (default) or oauth2 — OIDC providers set issuer_url (endpoints are discovered), OAuth2 providers set authorize_url/token_url/userinfo_url (and optionally introspect_url) explicitly. client_secret is PLAINTEXT and write-only: it is AES-256-GCM encrypted at rest and never echoed back (the response exposes only has_secret). Provide EITHER client_secret (encrypted at rest) OR client_secret_ref (a Keyring secret name), not both. scopes is a single space-separated string. ADMIN SESSION REQUIRED (SessionMiddleware + RequireAdmin, Bearer JWT only — X-Api-Key is rejected; set MONITOR_SESSION_TOKEN).\n\nProviders are rows in the answering zone's own MariaDB and govern who can sign in to THAT zone, so `zone` is required and verified — a provider created in the wrong zone appears on the wrong login page.",
+    "Create an SSO provider (POST /admin/sso-providers). slug and display_name are required; everything else is optional. kind is oidc (default) or oauth2 — OIDC providers set issuer_url (endpoints are discovered), OAuth2 providers set authorize_url/token_url/userinfo_url explicitly. client_secret is PLAINTEXT and write-only: it is AES-256-GCM encrypted at rest and never echoed back (the response exposes only has_secret). Provide EITHER client_secret (encrypted at rest) OR client_secret_ref (a Keyring secret name), not both. scopes is a single space-separated string. ADMIN SESSION REQUIRED (SessionMiddleware + RequireAdmin, Bearer JWT only — X-Api-Key is rejected; set MONITOR_SESSION_TOKEN).\n\nProviders are rows in the answering zone's own MariaDB and govern who can sign in to THAT zone, so `zone` is required and verified — a provider created in the wrong zone appears on the wrong login page.",
     {
         zone: z.string().describe(ZONE_PARAM_DESC),
         slug: z.string().describe("URL-safe unique identifier (required), e.g. \"google\" or \"okta\""),
@@ -1748,7 +1748,6 @@ server.tool(
         token_url: z.string().optional().describe("OAuth2 token endpoint. SSRF-validated."),
         userinfo_url: z.string().optional().describe("OAuth2/OIDC userinfo endpoint. SSRF-validated."),
         jwks_url: z.string().optional().describe("JWKS endpoint for verifying ID tokens. SSRF-validated."),
-        introspect_url: z.string().optional().describe("OAuth2 token introspection endpoint (used by the SSO revocation checkpoint). SSRF-validated."),
         client_id: z.string().optional().describe("OAuth2/OIDC client id"),
         client_secret: z.string().optional().describe("PLAINTEXT client secret — write-only, AES-256-GCM encrypted at rest, never returned. Mutually exclusive with client_secret_ref."),
         client_secret_ref: z.string().optional().describe("Keyring secret name to resolve the client secret from. Mutually exclusive with client_secret."),
@@ -1789,7 +1788,6 @@ server.tool(
         token_url: z.string().optional().describe("OAuth2 token endpoint. SSRF-validated."),
         userinfo_url: z.string().optional().describe("OAuth2/OIDC userinfo endpoint. SSRF-validated."),
         jwks_url: z.string().optional().describe("JWKS endpoint. SSRF-validated."),
-        introspect_url: z.string().optional().describe("OAuth2 introspection endpoint. SSRF-validated."),
         client_id: z.string().optional().describe("OAuth2/OIDC client id"),
         client_secret: z.string().optional().describe("PLAINTEXT client secret — write-only, encrypted at rest, never returned. Mutually exclusive with client_secret_ref."),
         client_secret_ref: z.string().optional().describe("Keyring secret name. Mutually exclusive with client_secret."),
