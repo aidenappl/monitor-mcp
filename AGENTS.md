@@ -106,7 +106,7 @@ tool here in the same change. See §7 for the current gaps.
 
 ---
 
-## 6. Tool inventory (56 tools)
+## 6. Tool inventory (58 tools)
 
 Tenancy/registry (added 2026-09-07, verified against
 `monitor-core/routes/HandleListZones.router.go` and `HandleListProjects.router.go`):
@@ -185,7 +185,7 @@ copying it.
 
 SSO / auth (added 2026-07-24, verified against `monitor-core/routes/HandleSSOConfig.router.go`,
 `HandleAdminSSOProviders.router.go`, `HandleGetSelf.router.go` + `RegisterSSORoutes.go`):
-`monitor_get_sso_config` (GET /auth/sso/config — public), `monitor_list_sso_providers`
+`monitor_list_accounts` / `monitor_update_account` (GET/PUT /admin/users — not `monitor_list_users`, which lists event user ids — approve pending SSO accounts, change roles, disable; admin session, control plane only, no `zone`: accounts are not zone rows), `monitor_get_sso_config` (GET /auth/sso/config — public), `monitor_list_sso_providers`
 (GET /admin/sso-providers), `monitor_create_sso_provider` (POST /admin/sso-providers),
 `monitor_update_sso_provider` (PUT /admin/sso-providers/{slug} — partial),
 `monitor_delete_sso_provider` (DELETE /admin/sso-providers/{slug}), `monitor_get_self`
@@ -567,7 +567,7 @@ There is no build step and no automated test suite, so verification is three thi
 
 ```bash
 node --check index.js                 # must pass
-grep -c 'server.tool(' index.js       # must match the count in §6 (56)
+grep -c 'server.tool(' index.js       # must match the count in §6 (58)
 grep -c 'server.registerPrompt(' index.js   # must match §6c (2)
 ```
 
@@ -576,7 +576,7 @@ Prompts and instructions need no `monitor-core`: drive `index.js` over stdio wit
 and a `prompts` capability, that `prompts/list` shows `check` and `triage`, and that
 `prompts/get` renders `check` with and without `service`/`window`, rejects `window:
 "yesterday"`, and rejects `triage` without `issue`. Last done 2026-10-10 (1.5.1): all of the
-above as stated, 56 tools still listed.
+above as stated, 58 tools still listed.
 
 …plus a **manual end-to-end smoke test** against a running `monitor-core` with a valid
 **admin-scope** key: drive `index.js` over stdio (`initialize`, `notifications/initialized`,

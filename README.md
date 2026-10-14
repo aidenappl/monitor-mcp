@@ -265,6 +265,8 @@ to.
 | `monitor_create_notification_channel` / `monitor_delete_notification_channel` | channels live in the answering zone's database |
 | `monitor_set_service_repo` / `monitor_delete_service_repo` | mappings serve the answering zone only |
 | `monitor_create_sso_provider` / `monitor_update_sso_provider` / `monitor_delete_sso_provider` | providers govern sign-in to the answering zone |
+| `monitor_list_accounts` | Monitor accounts with sign-in providers, pending first (admin session) |
+| `monitor_update_account` | Approve a pending account / change role / disable (admin session) |
 
 **The argument is verified, never routed.** It is not sent to Monitor and it cannot make a
 request go anywhere; it is compared against `zone` from `GET /health` and the call is

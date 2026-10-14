@@ -1831,6 +1831,36 @@ server.tool(
 );
 
 server.tool(
+    "monitor_list_accounts",
+    "List Monitor accounts with their sign-in providers, pending first (GET /admin/users). Accounts created by SSO auto-provisioning arrive role=pending and cannot use Monitor until an admin approves them with monitor_update_account. (monitor_list_users is different: user ids seen in events.) Filters: role (admin|editor|viewer|pending), q (email/name substring), limit, offset. Control plane only — a zone-only process has no users. ADMIN SESSION REQUIRED (SessionMiddleware + RequireAdmin, Bearer JWT only — X-Api-Key is rejected; set MONITOR_SESSION_TOKEN).",
+    {
+        role: z.enum(["admin", "editor", "viewer", "pending"]).optional().describe("Only accounts with this role"),
+        q: z.string().optional().describe("Substring of email, name or display name"),
+        limit: z.number().int().optional().describe("Max rows (default 50, max 500)"),
+        offset: z.number().int().optional().describe("Pagination offset"),
+    },
+    async (params) => {
+        const res = await api("GET", "/admin/users", params);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_update_account",
+    "Change a Monitor account's role or active flag (PUT /admin/users/{id}). Approving a pending account IS setting its role (viewer is the least privilege; admin can manage users and SSO). role=pending revokes access; active=false blocks sign-in. The API refuses changes to the caller's own account (400) and any change that leaves no active admin (409). Takes effect at once on the control plane; a zone honours an already-issued session for up to 15 min. ADMIN SESSION REQUIRED (SessionMiddleware + RequireAdmin, Bearer JWT only; set MONITOR_SESSION_TOKEN).",
+    {
+        id: z.number().int().describe("Account id (from monitor_list_accounts)"),
+        role: z.enum(["admin", "editor", "viewer", "pending"]).optional().describe("New role"),
+        active: z.boolean().optional().describe("false blocks the account; true re-enables it"),
+    },
+    async ({ id, ...fields }) => {
+        const payload = Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined));
+        const res = await api("PUT", `/admin/users/${id}`, null, payload);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
     "monitor_get_self",
     "Get the currently authenticated Monitor user and their linked sign-in identities (GET /auth/self). Returns the neutral user record (no password hash) plus an identities array of linked providers. SESSION REQUIRED: this route is behind SessionMiddleware and identifies the user FROM the session token, so it reflects whoever MONITOR_SESSION_TOKEN belongs to — X-Api-Key is not accepted and there is no way to look up an arbitrary user here. Returns 401 if MONITOR_SESSION_TOKEN is unset.",
     {},
