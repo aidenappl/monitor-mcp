@@ -265,13 +265,15 @@ to.
 | `monitor_create_notification_channel` / `monitor_delete_notification_channel` | channels live in the answering zone's database |
 | `monitor_set_service_repo` / `monitor_delete_service_repo` | mappings serve the answering zone only |
 | `monitor_create_sso_provider` / `monitor_update_sso_provider` / `monitor_delete_sso_provider` | providers govern sign-in to the answering zone |
-| `monitor_list_accounts` | Monitor accounts with sign-in providers, pending first (admin session) |
-| `monitor_update_account` | Approve a pending account / change role / disable (admin session) |
 
 **The argument is verified, never routed.** It is not sent to Monitor and it cannot make a
 request go anywhere; it is compared against `zone` from `GET /health` and the call is
 refused, unsent, on a mismatch. Nothing here can reach another zone — that is a different
 deployment behind a different URL.
+
+`monitor_list_accounts` / `monitor_update_account` (approve pending SSO accounts, change roles,
+disable) take **no** `zone`: accounts live on the control plane, not in a zone. They need an admin
+`MONITOR_SESSION_TOKEN`, like the SSO provider tools.
 
 It exists because Monitor binds a write to the zone of the process that answers it, and
 says nothing about which zone that was. Ask a server pointed at the control plane for an
