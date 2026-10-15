@@ -1265,9 +1265,13 @@ server.tool(
 
 server.tool(
     "monitor_bulk_update_issues",
-    "Move many issues to one status in a single call — by explicit ids, or by a filter using the same fields as monitor_list_issues. Issues already at the target status are skipped. Each pass changes at most 1000; the response's `remaining` is how many a repeat of the same call would still move, so drain a large filter by calling again until it is 0. Run with dry_run first to see `matched` without changing anything. Every changed issue gets a status timeline entry attributed to this API key.",
+    "Change many issues in a single call — status, priority and/or assignee — by explicit ids, or by a filter using the same fields as monitor_list_issues. At least one of status, priority, assignee_user_id, clear_priority or clear_assignee is required. Issues already at every requested value are skipped. Each pass changes at most 1000; the response's `remaining` is how many a repeat of the same call would still move, so drain a large filter by calling again until it is 0. Run with dry_run first to see `matched` without changing anything. Every change gets a timeline entry (status/priority/assignment) attributed to this API key.",
     {
-        status: z.enum(["unresolved", "in_progress", "resolved", "ignored"]).describe("Target status for every selected issue"),
+        status: z.enum(["unresolved", "in_progress", "resolved", "ignored"]).optional().describe("Target status for every selected issue"),
+        priority: z.enum(["low", "medium", "high", "critical"]).optional().describe("Set this priority on every selected issue"),
+        clear_priority: z.boolean().optional().describe("Remove the priority (sends priority: null). Do not combine with priority."),
+        assignee_user_id: z.number().int().optional().describe("Assign every selected issue to this Monitor user id"),
+        clear_assignee: z.boolean().optional().describe("Unassign (sends assignee_user_id: null). Do not combine with assignee_user_id."),
         ids: z.array(z.string()).optional().describe("Issue ids (max 1000). Supply this OR filter, not both."),
         filter: z.object({
             status: z.enum(["unresolved", "in_progress", "resolved", "ignored"]).optional().describe("Only issues currently at this status"),
@@ -1280,11 +1284,24 @@ server.tool(
         }).optional().describe("Select by the list filters. Must narrow by at least one field. Supply this OR ids, not both."),
         dry_run: z.boolean().optional().describe("Count what would change without changing it"),
     },
-    async ({ status, ids, filter, dry_run }) => {
+    async ({ status, priority, clear_priority, assignee_user_id, clear_assignee, ids, filter, dry_run }) => {
         if ((ids === undefined) === (filter === undefined)) {
             return { content: text({ error: "supply exactly one of ids or filter" }) };
         }
-        const body = { status };
+        if ((priority !== undefined && clear_priority) || (assignee_user_id !== undefined && clear_assignee)) {
+            return { content: text({ error: "a field cannot be both set and cleared" }) };
+        }
+        // An omitted key leaves a field alone; an explicit null clears it —
+        // the API tells the two apart, which is why the clear flags exist.
+        const body = {};
+        if (status !== undefined) body.status = status;
+        if (priority !== undefined) body.priority = priority;
+        if (clear_priority) body.priority = null;
+        if (assignee_user_id !== undefined) body.assignee_user_id = assignee_user_id;
+        if (clear_assignee) body.assignee_user_id = null;
+        if (Object.keys(body).length === 0) {
+            return { content: text({ error: "set at least one of status, priority, assignee_user_id, clear_priority or clear_assignee" }) };
+        }
         if (ids !== undefined) body.ids = ids;
         if (filter !== undefined) body.filter = filter;
         if (dry_run) body.dry_run = true;

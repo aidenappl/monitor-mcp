@@ -154,7 +154,9 @@ Service repositories: `monitor_list_service_repos`, `monitor_set_service_repo`,
 - **`status` is OPTIONAL on `monitor_update_issue`.** It used to be required, back when it
   was the only mutable field. Priority, title and assignee are now settable too.
 - **`monitor_bulk_update_issues` → `POST /v1/issues/bulk`** (added 2026-10-10, verified
-  against `monitor-core/routes/issues_bulk.go`). Status only. Exactly one of `ids` (≤ 1000,
+  against `monitor-core/routes/issues_bulk.go`; priority/assignee added 2026-10-15). Sets any of
+  status, priority and assignee — `clear_priority` / `clear_assignee` send explicit nulls, the
+  same convention as `monitor_update_issue`; at least one field is required. Exactly one of `ids` (≤ 1000,
   else 400) or `filter`; the filter keys are the list endpoint's (`status`, `service`, `q`,
   `assignee`, `has_pr`, `from`, `to`) and the API **refuses** `sort`/`order`/`limit`/`offset`
   and a filter that narrows nothing — so the schema exposes only the accepted keys. One pass
