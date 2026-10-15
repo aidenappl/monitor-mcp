@@ -260,9 +260,10 @@ to.
 | Tool | |
 |------|--|
 | `monitor_create_api_key` | binds a key to a project in the answering zone |
+| `monitor_rename_api_key` | renames a key in the answering zone (scope and project cannot change) |
 | `monitor_delete_api_key` | revokes a key in the answering zone — irreversible, and the producer's only symptom is a 401 |
 | `monitor_create_alert_rule` / `monitor_update_alert_rule` / `monitor_delete_alert_rule` | rules live in the answering zone's database |
-| `monitor_create_notification_channel` / `monitor_delete_notification_channel` | channels live in the answering zone's database |
+| `monitor_create_notification_channel` / `monitor_update_notification_channel` / `monitor_delete_notification_channel` | channels live in the answering zone's database; an update without `config` keeps the stored credential |
 | `monitor_set_service_repo` / `monitor_delete_service_repo` | mappings serve the answering zone only |
 | `monitor_create_sso_provider` / `monitor_update_sso_provider` / `monitor_delete_sso_provider` | providers govern sign-in to the answering zone |
 

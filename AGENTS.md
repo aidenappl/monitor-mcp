@@ -106,7 +106,7 @@ tool here in the same change. See §7 for the current gaps.
 
 ---
 
-## 6. Tool inventory (58 tools)
+## 6. Tool inventory (60 tools)
 
 Tenancy/registry (added 2026-09-07, verified against
 `monitor-core/routes/HandleListZones.router.go` and `HandleListProjects.router.go`):
@@ -169,17 +169,26 @@ Service repositories: `monitor_list_service_repos`, `monitor_set_service_repo`,
   and a changed body edits in place. The tool description tells the model to pass it — that
   wording is load-bearing, not decoration.
 
-API keys: `monitor_list_api_keys`, `monitor_create_api_key`, `monitor_delete_api_key`.
+API keys: `monitor_list_api_keys`, `monitor_create_api_key`, `monitor_rename_api_key`,
+`monitor_delete_api_key`. Rename → `PUT /v1/api-keys/{id}` (added 2026-10-15, verified
+against `monitor-core/routes/api_keys.go` `HandleUpdateAPIKey`): body `{name}` only — scope
+and project are immutable server-side; a duplicate name in the project is a 409.
 
 Alerts: `monitor_list_alert_rules`, `monitor_test_alert_rule`, `monitor_create_alert_rule`,
 `monitor_update_alert_rule`, `monitor_delete_alert_rule`, `monitor_list_alert_history`.
 
 Notification channels: `monitor_list_notification_channels`,
-`monitor_create_notification_channel`, `monitor_delete_notification_channel`.
+`monitor_create_notification_channel`, `monitor_update_notification_channel`,
+`monitor_delete_notification_channel`. Update → `PUT /v1/notification-channels/{id}`
+(added 2026-10-15, verified against `routes/alerts.go` `HandleUpdateNotificationChannel` +
+`query.UpdateNotificationChannel`): every field optional; ⚠️ an **omitted `config` keeps the
+stored credential** (the API never returns it, so a rename cannot resend it); a `type` change
+without a `config` is a 400. `PUT /v1/views/{id}` was added in the same monitor-core change and
+consciously has no tool — saved views are UI persistence with no tool family here.
 
-**Twelve of the tools above take a required, verified `zone`** — `monitor_create_api_key`
-and `monitor_delete_api_key`, the three alert-rule mutations, the two notification-channel
-mutations, the two service-repo mutations and the three SSO-provider mutations. It is
+**Fourteen of the tools above take a required, verified `zone`** — `monitor_create_api_key`,
+`monitor_rename_api_key` and `monitor_delete_api_key`, the three alert-rule mutations, the three
+notification-channel mutations, the two service-repo mutations and the three SSO-provider mutations. It is
 checked against `GET /health` and never forwarded; see **§6b** before adding, removing or
 copying it.
 
@@ -344,14 +353,15 @@ never put in a body or query string, and cannot make a request go anywhere. That
 whole difference from `project` in one line: `project` would be an input nothing reads,
 `zone` is an assertion this server checks itself.
 
-**Which tools take it** (12) — everything that creates or changes a row in a zone:
+**Which tools take it** (14) — everything that creates or changes a row in a zone:
 
 | Tool(s) | Binds |
 |---|---|
 | `monitor_create_api_key` | a key to a project in the answering zone |
+| `monitor_rename_api_key` | renames a key in the answering zone |
 | `monitor_delete_api_key` | revokes a key **in the answering zone** — the destructive one; see below |
 | `monitor_create_alert_rule`, `monitor_update_alert_rule`, `monitor_delete_alert_rule` | rule rows in the answering zone's MariaDB |
-| `monitor_create_notification_channel`, `monitor_delete_notification_channel` | channel rows, same |
+| `monitor_create_notification_channel`, `monitor_update_notification_channel`, `monitor_delete_notification_channel` | channel rows, same |
 | `monitor_set_service_repo`, `monitor_delete_service_repo` | the service→repo mapping for that zone only |
 | `monitor_create_sso_provider`, `monitor_update_sso_provider`, `monitor_delete_sso_provider` | who may sign in to that zone |
 
@@ -567,7 +577,7 @@ There is no build step and no automated test suite, so verification is three thi
 
 ```bash
 node --check index.js                 # must pass
-grep -c 'server.tool(' index.js       # must match the count in §6 (58)
+grep -c 'server.tool(' index.js       # must match the count in §6 (60)
 grep -c 'server.registerPrompt(' index.js   # must match §6c (2)
 ```
 
@@ -576,7 +586,7 @@ Prompts and instructions need no `monitor-core`: drive `index.js` over stdio wit
 and a `prompts` capability, that `prompts/list` shows `check` and `triage`, and that
 `prompts/get` renders `check` with and without `service`/`window`, rejects `window:
 "yesterday"`, and rejects `triage` without `issue`. Last done 2026-10-10 (1.5.1): all of the
-above as stated, 58 tools still listed.
+above as stated, 58 tools still listed. 2026-10-15 (1.7.0): `monitor_rename_api_key` and `monitor_update_notification_channel` smoke-tested against a local monitor-core; 60 tools.
 
 …plus a **manual end-to-end smoke test** against a running `monitor-core` with a valid
 **admin-scope** key: drive `index.js` over stdio (`initialize`, `notifications/initialized`,
