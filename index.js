@@ -1540,6 +1540,26 @@ server.tool(
     }
 );
 
+// Rename only: monitor-core refuses to change a key's scope or project (that
+// is a new key — an edit would silently re-home every event its producer
+// sends). Zone-verified for the same reason delete is: the ID is resolved in
+// THIS server's zone, whatever listing it was copied from.
+server.tool(
+    "monitor_rename_api_key",
+    "Rename an API key (PUT /v1/api-keys/{id}). Only the name can change — scope and project are what the key authorises and where its events land, and changing them means minting a new key. A name already used by another key in the same project returns 409. `zone` is required and verified.",
+    {
+        zone: z.string().describe(ZONE_PARAM_DESC),
+        id: z.string().describe("The API key ID to rename"),
+        name: z.string().describe("The new name"),
+    },
+    async ({ zone, id, name }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
+        const res = await api("PUT", `/v1/api-keys/${id}`, null, { name });
+        return { content: text(res) };
+    }
+);
+
 // ==================== ALERT RULES ====================
 
 server.tool(
@@ -1709,6 +1729,35 @@ server.tool(
         const refusal = await requireZone(zone);
         if (refusal) return refusal;
         const res = await api("DELETE", `/v1/notification-channels/${id}`);
+        return { content: text(res) };
+    }
+);
+
+// ⚠️ OMITTING `config` KEEPS THE STORED CREDENTIAL. monitor-core never returns
+// a channel's config (it is the credential), so a rename must not have to
+// resend it. Sending `config` replaces it whole; changing `type` requires it,
+// because the stored config belongs to the old type's notifier.
+server.tool(
+    "monitor_update_notification_channel",
+    "Edit a notification channel (PUT /v1/notification-channels/{id}). Every field is optional. OMIT `config` to keep the stored credential (a rename or retitle never needs it); pass `config` (a JSON string, shape per type as in monitor_create_notification_channel) to replace it. Changing `type` requires a new `config`. `zone` is required and verified.",
+    {
+        zone: z.string().describe(ZONE_PARAM_DESC),
+        id: z.string().describe("The notification channel ID"),
+        name: z.string().optional().describe("New channel name"),
+        type: z.enum(["webhook", "slack", "email", "pagerduty"]).optional().describe("New channel type (requires config)"),
+        config: z.string().optional().describe("Replacement configuration as a JSON string. Omit to keep the stored credential."),
+    },
+    async ({ zone, id, name, type, config }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
+        const body = {};
+        if (name !== undefined) body.name = name;
+        if (type !== undefined) body.type = type;
+        if (config !== undefined) body.config = config;
+        if (Object.keys(body).length === 0) {
+            return { content: [{ type: "text", text: "Nothing to update: pass name, type and/or config." }], isError: true };
+        }
+        const res = await api("PUT", `/v1/notification-channels/${id}`, null, body);
         return { content: text(res) };
     }
 );
