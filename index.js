@@ -408,23 +408,17 @@ const ZONE_PARAM_DESC =
 // the check is whether the handler's chain reaches scope.ProjectPredicate,
 // scopeIssues or apikeys.List in monitor-core.
 //
-// Verified against monitor-core 9cab9e2:
+// Verified against monitor-core 142c2ef (2026-10-18):
 //   zones/projects       registry reads (query.ListZones / ListProjects), no project filter
-//   service-repos        one service→repo mapping serves every project
-//   alert-rules (config) rules, channels and history are global rows in MariaDB
-//   dashboards, views    UI persistence, no tool today, listed so a future one starts right
 //
-// `/v1/alert-rules/{id}/test` is deliberately NOT exempt, which is why the
-// alert-rules pattern stops at one path segment: the rule row is global, but
-// testing one EVALUATES it, and alerts/evaluator.go:335 applies
-// scope.ProjectPredicate to that read — so the value returned is this project's.
+// ⚠️ THIS LIST USED TO BE LONGER, AND WRONG. Alert rules, notification channels,
+// alert history, policies, service groups and service-repos were exempt as
+// "global rows". monitor-core made every one of them project-scoped (alerting in
+// 1ab6996, 2026-09-12; service-repos in migration 133): each handler now calls
+// requireProject. Left exempt, their answers — this project's rules, this
+// project's channels — arrived with no _scope saying which project that was.
 const SCOPE_ECHO_EXEMPT = [
     /^\/v1\/zones(\/|$)/,
-    /^\/v1\/service-repos(\/|$)/,
-    /^\/v1\/notification-channels(\/|$)/,
-    /^\/v1\/alert-history(\/|$)/,
-    /^\/v1\/(dashboards|views)(\/|$)/,
-    /^\/v1\/alert-rules(\/[^/]+)?$/,
 ];
 
 // Annotates a project-scoped response with the scope that produced it, under a
@@ -756,8 +750,9 @@ Examples:
         to: z.string().optional().describe("End time (RFC3339 or unix timestamp). Defaults to now."),
         limit: z.number().optional().describe("Max events to return (1-1000, default 100)"),
         offset: z.number().optional().describe("Pagination offset"),
+        order: z.enum(["desc", "asc"]).optional().describe("Sort by timestamp: desc (newest first, default) or asc (oldest first — use it to read a window from its start)"),
     },
-    async ({ service, env, name, level, request_id, trace_id, job_id, user_id, name__contains, service__in, level__in, data_filters, from, to, limit, offset }) => {
+    async ({ service, env, name, level, request_id, trace_id, job_id, user_id, name__contains, service__in, level__in, data_filters, from, to, limit, offset, order }) => {
         const params = {};
 
         // Simple field filters
@@ -796,6 +791,7 @@ Examples:
 
         if (limit) params.limit = limit;
         if (offset) params.offset = offset;
+        if (order) params.order = order;
 
         const res = await api("GET", "/v1/events", params);
         return { content: text(res) };
@@ -1316,10 +1312,12 @@ server.tool(
     {
         id: z.string().describe("The issue ID"),
         limit: z.number().optional().describe("Max events to return (default 50, max 500)"),
+        before: z.string().optional().describe("RFC 3339 cursor: only events strictly older than this. To page past the newest 500, pass the oldest timestamp from the previous page."),
     },
-    async ({ id, limit }) => {
+    async ({ id, limit, before }) => {
         const params = {};
         if (limit) params.limit = limit;
+        if (before) params.before = before;
         const res = await api("GET", `/v1/issues/${id}/events`, params);
         return { content: text(res) };
     }
@@ -1355,7 +1353,7 @@ server.tool(
     "Add a note to an issue's timeline. This is how you record what you found and what you did while working an issue — attributed to this API key, visible in the Monitor UI alongside human comments.\n\nPASS A dedupe_key whenever the note might be written more than once (a retried task, or the same investigation resumed in a later session). The write is then idempotent per key: an identical body is a no-op, a changed body edits the note in place. Without one, every call appends another comment. A stable key such as 'triage:<issue-id>' or 'run:<task-name>' is usually right.",
     {
         id: z.string().describe("The issue ID"),
-        body: z.string().describe("The note. Markdown renders in the Monitor UI."),
+        body: z.string().describe("The note, at most 10,000 characters. Markdown renders in the Monitor UI."),
         dedupe_key: z.string().optional()
             .describe("Idempotency key, unique per issue. Reposting with the same key updates that note instead of adding another."),
     },
@@ -1603,7 +1601,7 @@ server.tool(
 
 server.tool(
     "monitor_create_alert_rule",
-    "Create a new alert rule. Types: threshold (value crosses limit), absence (no events in window), rate_change (sudden spike/drop). Conditions: gt, lt, gte, lte, eq. Priority: P0 (critical), P1 (high), P2 (medium), P3 (low). query_filters is a JSON array of {field, operator, value} objects to scope the query (e.g. [{\"field\":\"service\",\"operator\":\"eq\",\"value\":\"auth-service-v2\"}]).\n\nThe rule is a row in the answering zone's own MariaDB and is evaluated only against that zone's events, so `zone` is required and verified.",
+    "Create a new alert rule. Types: threshold (value crosses limit), absence (no events in window), rate_change (sudden spike/drop). Conditions: gt, lt, gte, lte, eq. Priority: P0 (critical), P1 (high), P2 (medium), P3 (low). query_filters is a JSON array of {field, operator, value} objects to scope the query (e.g. [{\"field\":\"service\",\"operator\":\"eq\",\"value\":\"auth-service-v2\"}]); an `in` value may be an array, a comma-separated string or a single value. A validation failure is a 400 whose message starts with the offending field's name. Run monitor_preview_alert_routing with the same arguments first to see which policies and channels it would reach.\n\nThe rule is a row in the answering zone's own MariaDB and is evaluated only against that zone's events, so `zone` is required and verified.",
     {
         zone: z.string().describe(ZONE_PARAM_DESC),
         name: z.string().describe("Human-readable alert name"),
@@ -1614,10 +1612,10 @@ server.tool(
         metric: z.enum(["count", "avg", "max", "min", "sum", "p50", "p95", "p99"]).optional().describe("Metric to evaluate (default: count)"),
         field: z.string().optional().describe("Data field for metric (e.g. data.duration_ms). Required for avg/max/min/sum/percentile metrics."),
         condition: z.enum(["gt", "lt", "gte", "lte", "eq"]).describe("Comparison condition"),
-        threshold: z.number().describe("Threshold value"),
-        evaluation_interval_seconds: z.number().optional().describe("How often to check (default 60)"),
-        for_seconds: z.number().optional().describe("How long condition must hold before firing (default 0)"),
-        cooldown_seconds: z.number().optional().describe("Min time between notifications (default 300)"),
+        threshold: z.number().optional().describe("Threshold value. REQUIRED for threshold and rate_change rules (monitor-core 400s without it — it used to silently save 0); ignored by absence rules."),
+        evaluation_interval_seconds: z.number().int().min(0).max(86400).optional().describe("How often to check, seconds (default 60, max 86400)"),
+        for_seconds: z.number().int().min(0).max(86400).optional().describe("How long the condition must hold before firing, seconds (default 0, max 86400)"),
+        cooldown_seconds: z.number().int().min(0).max(604800).optional().describe("Min time between notifications, seconds (default 300, max 604800)"),
         notification_channel_ids: z.string().optional().describe("JSON array of channel IDs to notify"),
         enabled: z.boolean().optional().describe("Whether the rule is active (default true)"),
     },
@@ -1645,13 +1643,13 @@ server.tool(
         type: z.enum(["threshold", "absence", "rate_change"]).optional(),
         priority: z.enum(["P0", "P1", "P2", "P3"]).optional(),
         query_filters: z.string().optional(),
-        metric: z.string().optional(),
+        metric: z.enum(["count", "avg", "max", "min", "sum", "p50", "p95", "p99"]).optional(),
         field: z.string().optional(),
         condition: z.enum(["gt", "lt", "gte", "lte", "eq"]).optional(),
-        threshold: z.number().optional(),
-        evaluation_interval_seconds: z.number().optional(),
-        for_seconds: z.number().optional(),
-        cooldown_seconds: z.number().optional(),
+        threshold: z.number().optional().describe("Changing type to threshold or rate_change needs a threshold, sent here or already stored."),
+        evaluation_interval_seconds: z.number().int().min(0).max(86400).optional(),
+        for_seconds: z.number().int().min(0).max(86400).optional(),
+        cooldown_seconds: z.number().int().min(0).max(604800).optional(),
         notification_channel_ids: z.string().optional(),
         enabled: z.boolean().optional(),
     },
@@ -1775,6 +1773,230 @@ server.tool(
             return { content: [{ type: "text", text: "Nothing to update: pass name, type and/or config." }], isError: true };
         }
         const res = await api("PUT", `/v1/notification-channels/${id}`, null, body);
+        return { content: text(res) };
+    }
+);
+
+// ==================== ALERT ROUTING ====================
+//
+// Where a firing rule GOES: notification policies (ordered, first match wins
+// unless continue_matching) and the service groups their matchers can name.
+// Verified against monitor-core 142c2ef: routes/alerts.go,
+// query/notification_policies.query.go, query/service_groups.query.go,
+// alerts/policies.go (PolicyMatchers), alerts/preview.go.
+
+const MATCHERS_DESC =
+    "JSON object (as a STRING) of conditions that must ALL hold; omit a key to not filter on it: {\"priority\":\"P0\"|\"P1\"|\"P2\"|\"P3\", \"services\":[\"svc\",...], \"service_group\":\"<service group id>\", \"status\":\"firing\"|\"resolved\", \"env\":\"production\", \"rule_name\":\"...\"}. \"{}\" matches every alert. A rule only matches `services`/`env` when its own query_filters pin that field with eq.";
+const POLICY_CHANNELS_DESC = "JSON array (as a STRING) of notification channel ids, e.g. [\"ch_1\",\"ch_2\"]. List them with monitor_list_notification_channels.";
+
+server.tool(
+    "monitor_preview_alert_routing",
+    "Dry-run a DRAFT alert rule through the real router (POST /v1/alert-rules/preview-routing): which policies would match it (each with matched + the reason), which channels would be notified, whether the rule's own notification_channel_ids are used, and any channel ids that do not exist. Stores nothing, sends nothing. Takes the same fields as monitor_create_alert_rule and refuses exactly what create refuses (field-named 400s), so run it before creating or editing a rule.",
+    {
+        name: z.string().describe("Rule name (required by validation; rule_name matchers compare against it)"),
+        type: z.enum(["threshold", "absence", "rate_change"]),
+        condition: z.enum(["gt", "lt", "gte", "lte", "eq"]),
+        threshold: z.number().optional().describe("Required for threshold and rate_change rules"),
+        priority: z.enum(["P0", "P1", "P2", "P3"]).optional().describe("Default P2 — priority decides which policy matches"),
+        query_filters: z.string().optional().describe("JSON array string, as for monitor_create_alert_rule. A service or env pinned here with eq is what service/env matchers compare against."),
+        metric: z.enum(["count", "avg", "max", "min", "sum", "p50", "p95", "p99"]).optional(),
+        field: z.string().optional(),
+        notification_channel_ids: z.string().optional().describe("JSON array string of the rule's own channel ids"),
+        description: z.string().optional(),
+    },
+    async (params) => {
+        const body = {};
+        for (const [k, v] of Object.entries(params)) if (v !== undefined) body[k] = v;
+        const res = await api("POST", "/v1/alert-rules/preview-routing", null, body);
+        return { content: text(res) };
+    }
+);
+
+// ⚠️ THIS SENDS A REAL NOTIFICATION through the channel's stored credentials.
+server.tool(
+    "monitor_test_notification_channel",
+    "Send a TEST notification through a channel (POST /v1/notification-channels/{id}/test). This really delivers — it posts to the Slack/webhook, pages PagerDuty, sends the email — so only call it when the user asked to test a channel. Outcomes: 200 {ok:true} delivered; 200 {ok:false, error} the config is valid but delivery failed (the reason: DNS, 404, timeout…); 400 naming the config key when the config can never deliver. The result is stored on the channel (last_test_*). `zone` is required and verified.",
+    {
+        zone: z.string().describe(ZONE_PARAM_DESC),
+        id: z.string().describe("The notification channel ID"),
+    },
+    async ({ zone, id }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
+        const res = await api("POST", `/v1/notification-channels/${id}/test`);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_list_notification_policies",
+    "List notification policies in evaluation order (`position`). For each firing rule the router walks them in order and notifies the channels of the first enabled policy whose matchers all hold; a policy with continue_matching lets later policies match too. The is_default policy catches what nothing else matches and cannot be deleted. matchers and channel_ids are JSON strings.",
+    {},
+    async () => {
+        const res = await api("GET", "/v1/notification-policies");
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_create_notification_policy",
+    "Create a notification policy (POST /v1/notification-policies). It is appended at the END of the evaluation order — use monitor_reorder_notification_policies to move it up. `zone` is required and verified.",
+    {
+        zone: z.string().describe(ZONE_PARAM_DESC),
+        name: z.string().describe("Policy name"),
+        description: z.string().optional(),
+        matchers: z.string().optional().describe(MATCHERS_DESC + " Default {}."),
+        channel_ids: z.string().optional().describe(POLICY_CHANNELS_DESC + " Default []."),
+        continue_matching: z.boolean().optional().describe("Keep evaluating later policies after this one matches (default false)"),
+        repeat_interval_seconds: z.number().int().min(0).optional().describe("Re-notify interval while still firing, seconds (0 = never)"),
+        enabled: z.boolean().optional().describe("Default true"),
+        is_default: z.boolean().optional().describe("Make this the catch-all default policy (default false)"),
+    },
+    async ({ zone, ...params }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
+        const body = {};
+        for (const [k, v] of Object.entries(params)) if (v !== undefined) body[k] = v;
+        // The API's `enabled` is a plain bool: omitted would create it DISABLED.
+        if (body.enabled === undefined) body.enabled = true;
+        const res = await api("POST", "/v1/notification-policies", null, body);
+        return { content: text(res) };
+    }
+);
+
+// ⚠️ PUT /v1/notification-policies/{id} IS NOT A CLEAN PARTIAL UPDATE.
+// UpdateNotificationPolicyRequest has plain (non-pointer) fields: the string
+// fields and repeat_interval_seconds change only when non-empty / non-zero, but
+// `enabled` and `continue_matching` are written on EVERY call — an omitted one
+// is false. So the current policy is read first and the two booleans the caller
+// did not set are carried over; otherwise renaming a policy would disable it.
+server.tool(
+    "monitor_update_notification_policy",
+    "Edit a notification policy. Only the fields you pass change; omitted booleans keep their current value (this tool reads the policy first). Limits of the API: a text field cannot be CLEARED (an empty value is ignored — use \"{}\" / \"[]\" to empty matchers / channel_ids) and repeat_interval_seconds cannot be set back to 0. is_default cannot be changed after creation. `zone` is required and verified.",
+    {
+        zone: z.string().describe(ZONE_PARAM_DESC),
+        id: z.string().describe("The notification policy ID"),
+        name: z.string().optional(),
+        description: z.string().optional(),
+        matchers: z.string().optional().describe(MATCHERS_DESC),
+        channel_ids: z.string().optional().describe(POLICY_CHANNELS_DESC),
+        continue_matching: z.boolean().optional(),
+        repeat_interval_seconds: z.number().int().min(1).optional(),
+        enabled: z.boolean().optional(),
+    },
+    async ({ zone, id, ...params }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
+        if (Object.values(params).every((v) => v === undefined)) {
+            return { content: [{ type: "text", text: "Nothing to update: pass at least one field." }], isError: true };
+        }
+        const current = await api("GET", `/v1/notification-policies/${id}`);
+        if (current?.success === false || !current?.data) return { content: text(current) };
+        const body = {
+            enabled: params.enabled ?? current.data.enabled,
+            continue_matching: params.continue_matching ?? current.data.continue_matching,
+        };
+        for (const k of ["name", "description", "matchers", "channel_ids", "repeat_interval_seconds"]) {
+            if (params[k] !== undefined) body[k] = params[k];
+        }
+        const res = await api("PUT", `/v1/notification-policies/${id}`, null, body);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_delete_notification_policy",
+    "Delete a notification policy. The default policy cannot be deleted (400). Alerts it routed fall through to later policies or the default. `zone` is required and verified.",
+    {
+        zone: z.string().describe(ZONE_PARAM_DESC),
+        id: z.string().describe("The notification policy ID"),
+    },
+    async ({ zone, id }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
+        const res = await api("DELETE", `/v1/notification-policies/${id}`);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_reorder_notification_policies",
+    "Change policy evaluation order (PUT /v1/notification-policies/reorder). The ids you list move to the FRONT in the order given; every policy you do not list keeps its current relative order after them. An unknown or repeated id rejects the whole call and nothing moves. `zone` is required and verified.",
+    {
+        zone: z.string().describe(ZONE_PARAM_DESC),
+        ids: z.array(z.string()).min(1).describe("Policy ids in the desired order"),
+    },
+    async ({ zone, ids }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
+        const res = await api("PUT", "/v1/notification-policies/reorder", null, { ids });
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_list_service_groups",
+    "List service groups: named sets of services that a notification policy can match with {\"service_group\":\"<id>\"}. `services` is a JSON string array.",
+    {},
+    async () => {
+        const res = await api("GET", "/v1/service-groups");
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_create_service_group",
+    "Create a service group. `zone` is required and verified.",
+    {
+        zone: z.string().describe(ZONE_PARAM_DESC),
+        name: z.string(),
+        description: z.string().optional(),
+        services: z.string().describe("JSON array (as a STRING) of service names, e.g. [\"auth-api\",\"auth-web\"]"),
+    },
+    async ({ zone, ...params }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
+        const body = {};
+        for (const [k, v] of Object.entries(params)) if (v !== undefined) body[k] = v;
+        const res = await api("POST", "/v1/service-groups", null, body);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_update_service_group",
+    "Edit a service group; only the fields you pass change (an empty value is ignored, so a field cannot be cleared — pass \"[]\" to empty `services`). `services` REPLACES the whole list. `zone` is required and verified.",
+    {
+        zone: z.string().describe(ZONE_PARAM_DESC),
+        id: z.string(),
+        name: z.string().optional(),
+        description: z.string().optional(),
+        services: z.string().optional().describe("JSON array (as a STRING) of service names — the complete new list"),
+    },
+    async ({ zone, id, ...params }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
+        const body = {};
+        for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== "") body[k] = v;
+        if (Object.keys(body).length === 0) {
+            return { content: [{ type: "text", text: "Nothing to update: pass name, description and/or services." }], isError: true };
+        }
+        const res = await api("PUT", `/v1/service-groups/${id}`, null, body);
+        return { content: text(res) };
+    }
+);
+
+server.tool(
+    "monitor_delete_service_group",
+    "Delete a service group. A policy whose matchers name it will no longer match anything through it — check monitor_list_notification_policies first. `zone` is required and verified.",
+    {
+        zone: z.string().describe(ZONE_PARAM_DESC),
+        id: z.string(),
+    },
+    async ({ zone, id }) => {
+        const refusal = await requireZone(zone);
+        if (refusal) return refusal;
+        const res = await api("DELETE", `/v1/service-groups/${id}`);
         return { content: text(res) };
     }
 );

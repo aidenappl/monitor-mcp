@@ -67,8 +67,9 @@ request shape from a description or a struct.** Every bug shipped across the fiv
 servers came from that: wrong units, wrong enum values, wrong content type, or params
 the handler silently ignores. The relevant handlers live in
 `monitor-core/routes/*.go`, `monitor-core/alerts/alerts.go`, and
-`monitor-core/services/query.go`. The route table is `monitor-core/main.go:237-374` (as of
-monitor-core `9cab9e2`); tenancy enforcement is `monitor-core/middleware/query_auth.go`.
+`monitor-core/services/query.go`. The route table is `monitor-core/router.go` (it moved out
+of `main.go`; checked at monitor-core `142c2ef`); tenancy enforcement is
+`monitor-core/middleware/query_auth.go`.
 
 Shape rules verified correct in this repo (keep them):
 - **Auth:** every request sends `X-Api-Key: <MONITOR_API_KEY>`. This must
@@ -87,7 +88,9 @@ Shape rules verified correct in this repo (keep them):
   `monitor-core`'s `Rule` struct types them as Go `string` (`alerts.go:34,42`). Send
   stringified JSON.
 - **Enums** (must match `monitor-core`): alert `type` ∈ threshold/absence/rate_change;
-  `condition` ∈ gt/lt/gte/lte/eq; `metric` ∈ count/sum/avg/min/max (⊂ AggregationType);
+  `condition` ∈ gt/lt/gte/lte/eq; `metric` ∈ count/sum/avg/min/max/p50/p95/p99;
+  `threshold` is required for threshold/rate_change (a 400 otherwise — it used to save 0)
+  and ignored by absence; seconds fields ≤ 86400 (evaluation, for) / 604800 (cooldown);
   `priority` ∈ P0–P3; issue `status` ∈ unresolved/resolved/ignored; api-key `scope` ∈
   admin/ingest; label names ∈ service/env/name/level/user_id.
 - **Body vs query:** analytics/timeseries/topn/gauge/compare are POST-body; events/labels/
@@ -106,7 +109,7 @@ tool here in the same change. See §7 for the current gaps.
 
 ---
 
-## 6. Tool inventory (60 tools)
+## 6. Tool inventory (71 tools)
 
 Tenancy/registry (added 2026-09-07, verified against
 `monitor-core/routes/HandleListZones.router.go` and `HandleListProjects.router.go`):
@@ -177,7 +180,35 @@ against `monitor-core/routes/api_keys.go` `HandleUpdateAPIKey`): body `{name}` o
 and project are immutable server-side; a duplicate name in the project is a 409.
 
 Alerts: `monitor_list_alert_rules`, `monitor_test_alert_rule`, `monitor_create_alert_rule`,
-`monitor_update_alert_rule`, `monitor_delete_alert_rule`, `monitor_list_alert_history`.
+`monitor_update_alert_rule`, `monitor_delete_alert_rule`, `monitor_list_alert_history`,
+`monitor_preview_alert_routing`. Event search takes `order` (asc/desc, `services.ParseOrder`);
+`monitor_get_issue_events` takes a `before` RFC 3339 cursor (`parseIssueEventsBefore`).
+
+Alert routing (added 2026-10-18 for 1.8.0, verified against monitor-core `142c2ef`:
+`routes/alerts.go`, `query/notification_policies.query.go`, `query/service_groups.query.go`,
+`alerts/policies.go`, `alerts/preview.go`): `monitor_preview_alert_routing`,
+`monitor_test_notification_channel`, `monitor_list|create|update|delete_notification_policy`,
+`monitor_reorder_notification_policies`, `monitor_list|create|update|delete_service_group`.
+
+- **`preview-routing` is a read** (in core's `readOnlyPOSTPaths`), so no `zone`. Its body is
+  the CREATE body and it refuses exactly what create refuses.
+- **Channel test SENDS a real notification.** 200 `{ok:true}` delivered; 200
+  `{ok:false,error}` delivery failed (the reason); 400 naming the config key when the config
+  can never deliver. Zone-verified like the other channel writes.
+- ⚠️ **Policy update is NOT a partial update on the wire.** `UpdateNotificationPolicyRequest`
+  has plain fields: strings and `repeat_interval_seconds` change only when non-empty /
+  non-zero, but `enabled` and `continue_matching` are written on every PUT — omitted means
+  false. The tool GETs the policy first and carries over the booleans the caller did not
+  set; a rename would otherwise disable the policy. Text fields cannot be cleared through
+  the API, `repeat_interval_seconds` cannot go back to 0, `is_default` is create-only.
+- **Create policy defaults `enabled: true`** (the API's plain bool would otherwise create
+  it disabled) and appends it at the END of the order.
+- **Reorder:** listed ids move to the front in order; the rest keep their relative order
+  after them; an unknown or duplicate id rejects the whole call.
+- **`matchers` / `channel_ids` / `services` are JSON strings**, like `query_filters`.
+  Matchers (`alerts.PolicyMatchers`): `priority`, `services`, `service_group` (an id),
+  `status` (`firing`/`resolved`), `env`, `rule_name`; all present keys must hold.
+- **Service-group update is partial** (empty values ignored); `services` replaces the list.
 
 Notification channels: `monitor_list_notification_channels`,
 `monitor_create_notification_channel`, `monitor_update_notification_channel`,
@@ -188,7 +219,9 @@ stored credential** (the API never returns it, so a rename cannot resend it); a 
 without a `config` is a 400. `PUT /v1/views/{id}` was added in the same monitor-core change and
 consciously has no tool — saved views are UI persistence with no tool family here.
 
-**Fourteen of the tools above take a required, verified `zone`** — `monitor_create_api_key`,
+**Twenty-three of the tools above take a required, verified `zone`** — the fourteen below
+plus the channel test, the four policy writes, the reorder and the three service-group
+writes. The original fourteen: — `monitor_create_api_key`,
 `monitor_rename_api_key` and `monitor_delete_api_key`, the three alert-rule mutations, the three
 notification-channel mutations, the two service-repo mutations and the three SSO-provider mutations. It is
 checked against `GET /health` and never forwarded; see **§6b** before adding, removing or
@@ -270,17 +303,17 @@ to look.** No single monitor-core response field carries all three.
   `sanitise()` uses, so a newly added tool is labelled by default rather than by
   remembering. The leading underscore marks it as this server's annotation, not a
   `monitor-core` field.
-- **What is exempt:** anything not under `/v1/`, plus the `/v1` surfaces that are global
-  configuration rather than tenant data — `SCOPE_ECHO_EXEMPT` in `index.js` lists them
-  with the reason: `zones`/`projects` (registry), `service-repos` (one mapping serves
-  every project), `alert-rules` (the rule rows), `notification-channels`, `alert-history`,
-  and `dashboards`/`views`. Labelling one of those would assert a filter that is not
-  there. It is a **denylist**, so a new tool is labelled by default; if you add one for a
+- **What is exempt:** anything not under `/v1/`, plus `/v1/zones*` — the registry, the
+  only `/v1` surface still global (`SCOPE_ECHO_EXEMPT` in `index.js`). Labelling it would
+  assert a filter that is not there.
+  ⚠️ **The list used to include `service-repos`, `alert-rules`, `notification-channels`,
+  `alert-history` and `dashboards`/`views` as "global rows". monitor-core made them all
+  project-scoped** (alerting in `1ab6996`, 2026-09-12 — every handler calls
+  `requireProject`; service-repos in migration 133), so for five weeks this project's rules
+  and channels came back with no `_scope`. Re-check the list against the handlers whenever
+  monitor-core changes tenancy. It is a **denylist**, so a new tool is labelled by default; if you add one for a
   global-config route, add its path. The test is whether the handler's chain in
   `monitor-core` reaches `scope.ProjectPredicate`, `scopeIssues` or `apikeys.List`.
-- **`POST /v1/alert-rules/{id}/test` is NOT exempt**, which is why the alert-rules pattern
-  stops at one path segment. The rule row is global, but testing one *evaluates* it, and
-  `alerts/evaluator.go:335` scopes that read — so the value returned is this project's.
 - **How `project` is resolved:** one `GET /v1/api-keys`. That is not an inference —
   `apikeys.List` filters the listing by the project `QueryAuthMiddleware` resolved for the
   request, so the `project_slug` read back **is** the server's own answer to "whose data
@@ -451,10 +484,8 @@ Per the house rule, these `monitor-core` routes have **no MCP tool** — decide 
 | Route(s) | Assessment |
 |---|---|
 | `GET /v1/service-repos/{service}` | **Consciously skipped.** `monitor_list_service_repos` returns every mapping in one call and the estate has ~15 services, so a single-service fetch would be a second round trip for a subset of what the model already has. |
-| `POST /v1/notification-channels/{id}/test` | Minor skip — list/create/delete are now covered (`monitor_list|create|delete_notification_channel`); the test-send route has no tool yet. Add or leave skipped. |
-| `/v1/service-groups`, `/v1/notification-policies` | Gap — routing config unreachable via MCP. Add or document as skipped. |
-| `GET /v1/alert-rules/{id}` | Minor — `list` covers it. |
-| `/v1/dashboards`, `/v1/views` | Likely intentional skip (UI persistence, not agent-facing). Document as skipped. |
+| `GET /v1/alert-rules/{id}`, `GET /v1/notification-policies/{id}` | **Consciously skipped** as tools — the lists cover them. (The policy GET is used internally by `monitor_update_notification_policy`.) |
+| `/v1/dashboards`, `/v1/views` | **Consciously skipped** — UI persistence (layouts, saved filters), not agent-facing. |
 | `POST/DELETE /auth/self/identities/{slug}` (link/unlink) | Skipped — these are interactive browser account-LINK flows (link returns an IdP `authorize_url` to redirect the user through), not agent-driven API calls. `GET /auth/self/identities` is covered indirectly (identities are included in `monitor_get_self`). |
 | `GET /self` (legacy `/v1`) | Minor skip. Note: the new `GET /auth/self` IS covered by `monitor_get_self` (session-gated). |
 | `/v1/events/stream`, `/v1/alerts/stream` (SSE) | Correctly skipped (streaming; also broken today — monitor-core AGENTS §9 B1). |
@@ -579,7 +610,7 @@ There is no build step and no automated test suite, so verification is three thi
 
 ```bash
 node --check index.js                 # must pass
-grep -c 'server.tool(' index.js       # must match the count in §6 (60)
+grep -c 'server.tool(' index.js       # must match the count in §6 (71)
 grep -c 'server.registerPrompt(' index.js   # must match §6c (2)
 ```
 
@@ -588,7 +619,7 @@ Prompts and instructions need no `monitor-core`: drive `index.js` over stdio wit
 and a `prompts` capability, that `prompts/list` shows `check` and `triage`, and that
 `prompts/get` renders `check` with and without `service`/`window`, rejects `window:
 "yesterday"`, and rejects `triage` without `issue`. Last done 2026-10-10 (1.5.1): all of the
-above as stated, 58 tools still listed. 2026-10-15 (1.7.0): `monitor_rename_api_key` and `monitor_update_notification_channel` smoke-tested against a local monitor-core; 60 tools.
+above as stated, 58 tools still listed. 2026-10-15 (1.7.0): `monitor_rename_api_key` and `monitor_update_notification_channel` smoke-tested against a local monitor-core; 60 tools. 2026-10-18 (1.8.0): reads (policies, service groups, preview routing incl. the threshold 400, `order`, `_scope` on rules/channels/history/service-repos and not on zones) against the live trailblaze zone; every write's request body checked against a recording mock monitor-core (policy-update boolean carry-over, zone refusal, bounds refusals); 71 tools.
 
 …plus a **manual end-to-end smoke test** against a running `monitor-core` with a valid
 **admin-scope** key: drive `index.js` over stdio (`initialize`, `notifications/initialized`,
