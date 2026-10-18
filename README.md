@@ -127,6 +127,18 @@ Several services routinely share one repository — `auth-service-v1` and `auth-
 are versions of one service — so the mapping is explicit rather than derived from the
 service name. Mapping a service is what lets `monitor_link_issue_pr` accept a bare `#42`.
 
+### Alerting
+| Tool | Description |
+|------|-------------|
+| `monitor_list_alert_rules` / `monitor_list_alert_history` | Rules with their firing state; when they fired and resolved |
+| `monitor_test_alert_rule` | Evaluate a rule now: value, threshold, whether it would fire |
+| `monitor_preview_alert_routing` | Dry-run a draft rule through the real router: matching policies (with reasons) and channels |
+| `monitor_create_alert_rule` / `monitor_update_alert_rule` / `monitor_delete_alert_rule` | Rule CRUD — `threshold` required for threshold/rate_change |
+| `monitor_list_notification_channels` + create / update / delete | Delivery channels (webhook, Slack, email, PagerDuty) |
+| `monitor_test_notification_channel` | **Sends** a real test notification; reports `{ok, error}` |
+| `monitor_list_notification_policies` + create / update / delete / reorder | Ordered routing: the first matching enabled policy decides the channels |
+| `monitor_list_service_groups` + create / update / delete | Named service sets a policy can match on |
+
 ## Workflows & guidance
 
 The server ships its usage rules and two workflows, so every machine running `npx -y monitor-mcp`
@@ -224,9 +236,9 @@ zone is simply absent with a note. The answer always comes back; only the label 
 missing.
 
 Responses that carry **no** `_scope` are the ones that are not per-project in the first
-place: health, the zone/project registry, service→repo mappings, alert rules,
-notification channels and alert history are install-wide configuration, shared by every
-project.
+place: health and the zone/project registry. Everything else under `/v1` — events,
+issues, analytics, alert rules, channels, policies, service groups, history, service→repo
+mappings — is per project and labelled.
 
 **To read a second project, add a second entry** with a key bound to it:
 
@@ -263,6 +275,9 @@ to.
 | `monitor_rename_api_key` | renames a key in the answering zone (scope and project cannot change) |
 | `monitor_delete_api_key` | revokes a key in the answering zone — irreversible, and the producer's only symptom is a 401 |
 | `monitor_create_alert_rule` / `monitor_update_alert_rule` / `monitor_delete_alert_rule` | rules live in the answering zone's database |
+| `monitor_test_notification_channel` | sends through a channel stored in the answering zone |
+| `monitor_create|update|delete_notification_policy` / `monitor_reorder_notification_policies` | routing policies live in the answering zone's database |
+| `monitor_create|update|delete_service_group` | service groups live in the answering zone's database |
 | `monitor_create_notification_channel` / `monitor_update_notification_channel` / `monitor_delete_notification_channel` | channels live in the answering zone's database; an update without `config` keeps the stored credential |
 | `monitor_set_service_repo` / `monitor_delete_service_repo` | mappings serve the answering zone only |
 | `monitor_create_sso_provider` / `monitor_update_sso_provider` / `monitor_delete_sso_provider` | providers govern sign-in to the answering zone |
