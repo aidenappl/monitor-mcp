@@ -638,7 +638,7 @@ catches the parameters the API ignores, and the smoke test is what catches the r
 Last verified **2026-09-08** against `https://api.monitor.appleby.cloud` (the control plane,
 `role: both`, zone `trailblaze`): 55 tools listed, every `inputSchema` a valid object.
 
-- `monitor_health` → `{status: ok, role: "both", zone: "trailblaze", clickhouse_ok, mariadb_ok, alerting_ok}`.
+- `monitor_health` → `{status: ok, role: "both", zone: "trailblaze", clickhouse_ok, mariadb_ok, alerting_ok}`. Since monitor-core APL-88 it also carries `last_drop_at`, `dropped_recent`, `dropped_window_minutes` and `clickhouse_disk`; the tool description tells agents that `dropped` is lifetime and "dropping now" is `dropped_recent > 0`.
 - `monitor_list_zones` → **TWO** active zones (`trailblaze`, `appleby`) — the fleet registry,
   because this URL is the control plane. It is not the answer to "which zone am I on".
 - `monitor_list_services` → `_scope {zone: "trailblaze", role: "both", project: "default",
