@@ -36,7 +36,7 @@ Add to `~/.mcp.json`:
 ### Discovery
 | Tool | Description |
 |------|-------------|
-| `monitor_health` | API health and queue stats (enqueued, dropped, pending), plus `zone` and `role` — the answering process's own identity |
+| `monitor_health` | API health and queue stats (enqueued, lifetime dropped, pending), recent drops (`dropped_recent`, `last_drop_at`), ClickHouse disk (`clickhouse_disk`), plus `zone` and `role` — the answering process's own identity |
 | `monitor_list_services` | List all services sending events |
 | `monitor_list_environments` | List all environments (prod, staging, dev) |
 | `monitor_list_event_names` | List event names, optionally filtered by service |
